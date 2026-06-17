@@ -143,8 +143,8 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama serve &                       # run in tmux/background
 ollama pull qwen2.5:7b-instruct
 
-# 5. Streaming TTS server (cudagraph = reliable; megakernel = faster, see notes)
-python server/tts_server.py --port 8000 --engine cudagraph
+# 5. Streaming TTS server (megakernel = the 28%-faster talker; cudagraph = fallback)
+python server/tts_server.py --port 8000 --engine megakernel
 ```
 
 ### Client (Mac, Apple Silicon)
@@ -205,13 +205,15 @@ talker (cosine 0.9997) and is 28% faster than the CUDA-graph talker; streaming
 is true frame-by-frame (not buffered); reproducible kernel patch.
 
 **Rough / known issues:**
-- **Megakernel ⇄ predictor-CUDA-graph coexistence:** the megakernel
-  occasionally grid-sync **deadlocks** (GPU pegged, no progress) when co-running
-  with the predictor's CUDA graph in the streaming-server warmup. It runs fine
-  standalone (benchmark + e2e), so the **live server defaults to `--engine
-  cudagraph`** for reliability; the megakernel win is established via the
-  benchmark and standalone e2e. Fix (future work): give the megakernel a
-  dedicated CUDA stream, or replace the predictor CUDA graph.
+- **Megakernel startup contention:** the megakernel launches 128 *persistent
+  grid-synced* blocks that must all be co-resident on the SMs at once. If another
+  process is actively using the GPU *at launch* (e.g. Ollama loading weights, or
+  a server restart mid-flight), the blocks can't all schedule and the grid-sync
+  spins (GPU pegged, no progress). Starting it on a settled GPU resolves it — the
+  **live server now runs `--engine megakernel`** reliably (verified across the
+  streaming server + repeated requests at ~84 ms TTFC). `--engine cudagraph`
+  remains available as a fallback. A more robust fix would lower
+  `LDG_NUM_BLOCKS` so the kernel co-resides even under contention.
 - **TTFC over the network:** box-local TTFC is 84–107 ms, but end-to-end over the
   SSH tunnel is ~700 ms — dominated by network round-trip + per-request HTTP
   setup, not compute. A persistent connection / co-locating the client would
