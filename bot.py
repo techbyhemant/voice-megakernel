@@ -46,13 +46,14 @@ LLM_MODEL = "qwen2.5:7b-instruct"            # served by Ollama on the 5090
 REMOTE_LLM_BASE = "http://localhost:11435/v1"
 CLAUDE_MODEL = "claude-sonnet-4-6"           # only used if ANTHROPIC_API_KEY is set
 
-# Barge-in control: False mutes the mic while the bot speaks (speaker-safe, no
-# interruptions). True allows barge-in but needs headphones / echo cancellation.
-# False = mute mic while the bot speaks → bot reliably finishes each reply
-# (no mid-reply cancellation). True enables barge-in but needs headphones AND a
-# less-sensitive VAD, and rapid speech can cancel replies. False is the reliable
-# demo mode.
-ALLOW_INTERRUPTIONS = False
+# Barge-in control:
+#   True  = mic stays live while the bot speaks, so you can interrupt it (real
+#           phone-call feel). REQUIRES HEADPHONES — on speakers the bot hears its
+#           own voice and interrupts itself. The server handles a mid-reply cancel
+#           cleanly (lock release + watchdog), so this is now safe end-to-end.
+#   False = mute the mic while the bot speaks (speaker-safe, strict turn-taking).
+# Use headphones with True; switch to False if you must demo on speakers.
+ALLOW_INTERRUPTIONS = True
 
 # Carrier-negotiation persona (e3's domain). Warm + brief: on a real phone call
 # a good broker is personable, and short replies = far less latency/gaps.
@@ -162,7 +163,9 @@ async def main():
     vad = SileroVADAnalyzer(params=VADParams(
         confidence=0.7,
         min_volume=0.6,
-        start_secs=0.2,
+        # With barge-in on, require a bit more sustained speech (0.35s) so a cough
+        # or stray "uh" doesn't cancel the bot mid-reply; still feels responsive.
+        start_secs=0.35 if ALLOW_INTERRUPTIONS else 0.2,
         stop_secs=0.2,     # matches Pipecat's benchmark default (silences the warning)
     ))
     user_agg, assistant_agg = LLMContextAggregatorPair(
