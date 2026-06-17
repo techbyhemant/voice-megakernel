@@ -183,8 +183,9 @@ instrument the signals that map to call quality:
 - **Live per-turn metrics, split by layer:** every reply prints **compute(GPU)**
   TTFC/RTF (measured server-side, no network — `tts_server.py /metrics`) *and*
   **end-to-end** TTFC/RTF incl. network (`remote_tts_service.py`). Seeing both
-  side by side attributes latency to the right layer (e.g. 138 ms compute vs
-  709 ms end-to-end ⇒ ~570 ms is network/geography, not the model).
+  side by side attributes latency to the right layer (measured demo run,
+  `chunk_size=2`: **~67 ms compute vs ~590 ms end-to-end ⇒ ~520 ms is
+  network/geography over the SSH tunnel, not the model**).
 - **What you'd monitor in production:**
   - **TTFC p50/p99** — the turn-taking latency a caller feels (alert if p99 climbs).
   - **RTF** — must stay < 1.0 or audio stutters (alert as it approaches 1.0).
@@ -195,8 +196,8 @@ instrument the signals that map to call quality:
   live metrics apply online.
 
 Note: live end-to-end TTFC includes network round-trip (hundreds of ms over the
-SSH tunnel); the **on-GPU 84 ms** is the compute figure a co-located deployment
-would see.
+SSH tunnel); the **on-GPU compute figure** (84 ms at `chunk_size=4`, ~67 ms at the
+`chunk_size=2` demo default) is what a co-located deployment would see.
 
 ## What works, what's rough (honest)
 
