@@ -35,6 +35,27 @@ MODEL = None
 SR = 24000
 _gpu_lock = threading.Lock()  # serialize GPU inference (one utterance at a time)
 _last_metrics = {}            # compute-only metrics of the most recent utterance
+_lock_held_since = None       # monotonic time the lock was acquired (None = free)
+WEDGE_TIMEOUT = 20.0          # > any real reply; longer => assume parked/wedged
+
+
+def _lock_watchdog():
+    """A disconnected streaming response leaves its sync generator parked at
+    `yield` STILL holding the GPU lock (Starlette doesn't close it), which would
+    wedge every later request. If the lock is held longer than any real
+    utterance, force-release it. threading.Lock isn't thread-owned, so another
+    thread may release it."""
+    global _lock_held_since
+    while True:
+        time.sleep(2.0)
+        held = _lock_held_since
+        if held is not None and (time.monotonic() - held) > WEDGE_TIMEOUT:
+            _lock_held_since = None
+            try:
+                _gpu_lock.release()
+                print("WATCHDOG: force-released a wedged GPU lock", flush=True)
+            except RuntimeError:
+                pass
 
 
 class TTSRequest(BaseModel):
@@ -65,9 +86,15 @@ def metrics():
 def tts(req: TTSRequest):
     def generate():
         global _last_metrics
-        # Hold the GPU lock for the whole utterance so concurrent requests
-        # don't corrupt the shared CUDA graphs.
-        with _gpu_lock:
+        # Serialize GPU inference (one utterance at a time) so concurrent
+        # requests don't corrupt shared state. CRITICAL: acquire with a timeout
+        # and release in `finally`, so an interrupted turn (client disconnect ->
+        # GeneratorExit) can't leave the lock held and wedge every later request.
+        global _lock_held_since
+        if not _gpu_lock.acquire(timeout=30):
+            return  # a prior request is wedged; fail fast instead of hanging
+        _lock_held_since = time.monotonic()
+        try:
             t0 = time.perf_counter()
             gen_ttfc_ms = None
             n_samples = 0
@@ -90,6 +117,13 @@ def tts(req: TTSRequest):
                 "gen_rtf": round(total_s / audio_s, 3) if audio_s else None,
                 "audio_s": round(audio_s, 2),
             }
+        finally:
+            # Watchdog may have already force-released it; guard the release.
+            _lock_held_since = None
+            try:
+                _gpu_lock.release()
+            except RuntimeError:
+                pass
 
     return StreamingResponse(generate(), media_type="application/octet-stream")
 
@@ -128,5 +162,6 @@ if __name__ == "__main__":
     ):
         pass
 
+    threading.Thread(target=_lock_watchdog, daemon=True).start()
     print(f"READY — streaming TTS on :{args.port} (sr={SR})", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
