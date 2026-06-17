@@ -48,7 +48,11 @@ CLAUDE_MODEL = "claude-sonnet-4-6"           # only used if ANTHROPIC_API_KEY is
 
 # Barge-in control: False mutes the mic while the bot speaks (speaker-safe, no
 # interruptions). True allows barge-in but needs headphones / echo cancellation.
-ALLOW_INTERRUPTIONS = True   # barge-in — USE HEADPHONES (else the bot hears itself)
+# False = mute mic while the bot speaks → bot reliably finishes each reply
+# (no mid-reply cancellation). True enables barge-in but needs headphones AND a
+# less-sensitive VAD, and rapid speech can cancel replies. False is the reliable
+# demo mode.
+ALLOW_INTERRUPTIONS = False
 
 # Carrier-negotiation persona (e3's domain). Kept terse: on a real phone call
 # the broker speaks in short turns, and short replies = far less latency/gaps.
