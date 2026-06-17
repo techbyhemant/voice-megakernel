@@ -38,7 +38,7 @@ class RemoteQwenTTSService(TTSService):
         base_url: str = "http://localhost:8000",
         speaker: str = "uncle_fu",
         language: str = "English",
-        chunk_size: int = 2,  # 2 frames/chunk: ~64 ms TTFC, RTF 0.24 (4=84 ms; 1=55 ms)
+        chunk_size: int = 2,  # 2 frames/chunk: balanced point — TTFC ~53-59 ms, RTF ~0.18 (cs1=lower TTFC/higher RTF; cs≥6=RTF<0.1)
         **kwargs,
     ):
         super().__init__(
