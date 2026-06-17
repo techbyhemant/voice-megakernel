@@ -79,7 +79,9 @@ def _stretch(audio, speed: float):
     per-chunk to keep streaming; speed>1 = faster. Phase-vocoder, so a chunk
     boundary can warble slightly — fine at modest speeds (~1.15)."""
     a = np.asarray(audio, dtype=np.float32).reshape(-1)
-    if abs(speed - 1.0) < 1e-3 or a.size < 32:
+    # Skip tiny chunks (e.g. the partial final chunk): too short for the n_fft=2048
+    # phase vocoder, and ~80 ms at natural speed is imperceptible.
+    if abs(speed - 1.0) < 1e-3 or a.size < 2048:
         return a
     import librosa
     return librosa.effects.time_stretch(a, rate=speed)
