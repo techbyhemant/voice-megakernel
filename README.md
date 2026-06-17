@@ -180,9 +180,11 @@ TTFC 107 ms / RTF 0.25; chunk 12: TTFC 232 ms / RTF 0.22 on the CUDA-graph path)
 A phone agent fails *quietly* — audio just gets laggy or choppy — so you
 instrument the signals that map to call quality:
 
-- **Live per-turn metrics:** the agent prints `TTFC`, `RTF`, and audio duration
-  for every reply (`remote_tts_service.py`), so degradation is visible *as it
-  happens*, not in a post-mortem.
+- **Live per-turn metrics, split by layer:** every reply prints **compute(GPU)**
+  TTFC/RTF (measured server-side, no network — `tts_server.py /metrics`) *and*
+  **end-to-end** TTFC/RTF incl. network (`remote_tts_service.py`). Seeing both
+  side by side attributes latency to the right layer (e.g. 138 ms compute vs
+  709 ms end-to-end ⇒ ~570 ms is network/geography, not the model).
 - **What you'd monitor in production:**
   - **TTFC p50/p99** — the turn-taking latency a caller feels (alert if p99 climbs).
   - **RTF** — must stay < 1.0 or audio stutters (alert as it approaches 1.0).

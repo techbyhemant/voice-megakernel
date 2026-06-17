@@ -48,14 +48,15 @@ CLAUDE_MODEL = "claude-sonnet-4-6"           # only used if ANTHROPIC_API_KEY is
 
 # Barge-in control: False mutes the mic while the bot speaks (speaker-safe, no
 # interruptions). True allows barge-in but needs headphones / echo cancellation.
-ALLOW_INTERRUPTIONS = False
+ALLOW_INTERRUPTIONS = True   # barge-in — USE HEADPHONES (else the bot hears itself)
 
-# Carrier-negotiation persona (e3's domain: voice freight brokerage).
+# Carrier-negotiation persona (e3's domain). Kept terse: on a real phone call
+# the broker speaks in short turns, and short replies = far less latency/gaps.
 SYSTEM_PROMPT = (
-    "You are a freight brokerage voice agent negotiating a load with a truck "
-    "carrier over the phone. Be concise, natural, and professional — one or two "
-    "sentences per turn, since you are speaking aloud. Acknowledge the carrier, "
-    "make and counter offers, and work toward a fair agreed rate for the load."
+    "You are a freight broker negotiating a load rate with a truck carrier on a "
+    "phone call. Reply in ONE short sentence — quick, natural, conversational. "
+    "Make or counter offers and drive toward a fair agreed rate. Never list or "
+    "give long explanations; keep it to a single brief spoken line."
 )
 
 
@@ -102,11 +103,12 @@ async def main():
     # Tuned to avoid FALSE triggers (ambient noise / mic hiss interrupting the
     # bot). Stricter than defaults: needs higher speech confidence, more volume,
     # and ~0.4s of sustained speech before it believes a turn started.
+    # Snappier turn detection (headphones avoid the bot's voice triggering it).
     vad = SileroVADAnalyzer(params=VADParams(
-        confidence=0.85,   # default 0.7 — require stronger "this is speech"
-        min_volume=0.7,    # default 0.6 — require louder input
-        start_secs=0.4,    # default 0.2 — ignore short blips
-        stop_secs=0.6,     # default 0.2 — wait longer before ending your turn
+        confidence=0.7,
+        min_volume=0.6,
+        start_secs=0.2,
+        stop_secs=0.3,     # shorter = quicker to start replying after you pause
     ))
     user_agg, assistant_agg = LLMContextAggregatorPair(
         context,

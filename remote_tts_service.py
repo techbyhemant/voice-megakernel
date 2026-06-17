@@ -47,9 +47,18 @@ class RemoteQwenTTSService(TTSService):
             **kwargs,
         )
         self._url = base_url.rstrip("/") + "/tts"
+        self._metrics_url = base_url.rstrip("/") + "/metrics"
         self._speaker = speaker
         self._language = language
         self._chunk_size = chunk_size
+        self._session = None  # persistent HTTP connection (keep-alive across turns)
+
+    async def _get_session(self):
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=120, sock_read=60)
+            )
+        return self._session
 
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         text = (text or "").strip()
@@ -69,28 +78,38 @@ class RemoteQwenTTSService(TTSService):
         t0 = time.perf_counter()
         ttfc_ms = None
         n_bytes = 0
-        timeout = aiohttp.ClientTimeout(total=120, sock_read=60)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(self._url, json=payload) as resp:
-                resp.raise_for_status()
-                async for data in resp.content.iter_chunked(4096):
-                    if not data:
-                        continue
-                    # Guard against an odd byte (keep 16-bit sample alignment).
-                    if len(data) % 2:
-                        data = data[:-1]
-                    if ttfc_ms is None:
-                        ttfc_ms = (time.perf_counter() - t0) * 1000.0
-                    n_bytes += len(data)
-                    yield TTSAudioRawFrame(
-                        audio=data,
-                        sample_rate=SAMPLE_RATE,
-                        num_channels=NUM_CHANNELS,
-                    )
+        session = await self._get_session()
+        async with session.post(self._url, json=payload) as resp:
+            resp.raise_for_status()
+            async for data in resp.content.iter_chunked(4096):
+                if not data:
+                    continue
+                # Guard against an odd byte (keep 16-bit sample alignment).
+                if len(data) % 2:
+                    data = data[:-1]
+                if ttfc_ms is None:
+                    ttfc_ms = (time.perf_counter() - t0) * 1000.0
+                n_bytes += len(data)
+                yield TTSAudioRawFrame(
+                    audio=data,
+                    sample_rate=SAMPLE_RATE,
+                    num_channels=NUM_CHANNELS,
+                )
         total_s = time.perf_counter() - t0
         audio_s = n_bytes / (SAMPLE_RATE * 2)  # 16-bit mono
         rtf = (total_s / audio_s) if audio_s else float("nan")
-        # End-to-end (includes network); the on-GPU numbers are in the benchmark.
-        print(f"📊 [TTS] TTFC={ttfc_ms:.0f}ms  RTF={rtf:.2f}  audio={audio_s:.2f}s  "
-              f"(end-to-end, incl. network)  «{text[:48]}»", flush=True)
+        # Server-side COMPUTE metrics (no network) for the same utterance — shows
+        # how much of the end-to-end latency is GPU vs network.
+        gen = {}
+        try:
+            async with session.get(self._metrics_url) as r:
+                gen = await r.json()
+        except Exception:
+            pass
+        print(
+            f"📊 [TTS] compute(GPU): TTFC={gen.get('gen_ttfc_ms')}ms RTF={gen.get('gen_rtf')}  |  "
+            f"end-to-end(+net): TTFC={ttfc_ms:.0f}ms RTF={rtf:.2f}  audio={audio_s:.2f}s  "
+            f"«{text[:40]}»",
+            flush=True,
+        )
         yield TTSStoppedFrame()

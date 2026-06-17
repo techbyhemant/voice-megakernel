@@ -19,6 +19,7 @@ Run:  /venv/main/bin/python tts_server.py --port 8000
 
 import argparse
 import threading
+import time
 
 import numpy as np
 import uvicorn
@@ -33,6 +34,7 @@ app = FastAPI(title="qwen3-tts streaming server")
 MODEL = None
 SR = 24000
 _gpu_lock = threading.Lock()  # serialize GPU inference (one utterance at a time)
+_last_metrics = {}            # compute-only metrics of the most recent utterance
 
 
 class TTSRequest(BaseModel):
@@ -53,12 +55,22 @@ def health():
     return JSONResponse({"ok": MODEL is not None, "sample_rate": SR})
 
 
+@app.get("/metrics")
+def metrics():
+    """Compute-only metrics (no network) of the most recent /tts request."""
+    return JSONResponse(_last_metrics)
+
+
 @app.post("/tts")
 def tts(req: TTSRequest):
     def generate():
+        global _last_metrics
         # Hold the GPU lock for the whole utterance so concurrent requests
         # don't corrupt the shared CUDA graphs.
         with _gpu_lock:
+            t0 = time.perf_counter()
+            gen_ttfc_ms = None
+            n_samples = 0
             for audio, _sr, _timing in MODEL.generate_custom_voice_streaming(
                 text=req.text,
                 speaker=req.speaker,
@@ -67,7 +79,17 @@ def tts(req: TTSRequest):
             ):
                 if audio is None or len(audio) == 0:
                     continue
+                if gen_ttfc_ms is None:
+                    gen_ttfc_ms = (time.perf_counter() - t0) * 1000.0
+                n_samples += len(audio)
                 yield _to_pcm16(audio)
+            total_s = time.perf_counter() - t0
+            audio_s = n_samples / SR if SR else 0.0
+            _last_metrics = {
+                "gen_ttfc_ms": round(gen_ttfc_ms, 1) if gen_ttfc_ms else None,
+                "gen_rtf": round(total_s / audio_s, 3) if audio_s else None,
+                "audio_s": round(audio_s, 2),
+            }
 
     return StreamingResponse(generate(), media_type="application/octet-stream")
 
