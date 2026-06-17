@@ -36,7 +36,7 @@ SR = 24000
 _gpu_lock = threading.Lock()  # serialize GPU inference (one utterance at a time)
 _last_metrics = {}            # compute-only metrics of the most recent utterance
 _lock_held_since = None       # monotonic time the lock was acquired (None = free)
-WEDGE_TIMEOUT = 20.0          # > any real reply; longer => assume parked/wedged
+WEDGE_TIMEOUT = 60.0          # > any real reply (incl. long ones + stretch); longer => parked/wedged
 
 
 def _lock_watchdog():
@@ -65,12 +65,24 @@ class TTSRequest(BaseModel):
     chunk_size: int = 4   # ~333 ms/chunk; smaller = lower time-to-first-audio
     temperature: float = 0.4  # talker sampling: lower = more consistent prosody, less expressive (0.9 default)
     top_k: int = 50
+    speed: float = 1.15   # pitch-preserving playback speed (1.0 = natural); model has no rate knob
 
 
 def _to_pcm16(audio) -> bytes:
     """float32 [-1,1] -> 16-bit little-endian PCM bytes."""
     a = np.asarray(audio, dtype=np.float32).reshape(-1)
     return np.clip(a * 32768.0, -32768, 32767).astype("<i2").tobytes()
+
+
+def _stretch(audio, speed: float):
+    """Pitch-preserving time-stretch (Qwen3-TTS has no rate knob). Applied
+    per-chunk to keep streaming; speed>1 = faster. Phase-vocoder, so a chunk
+    boundary can warble slightly — fine at modest speeds (~1.15)."""
+    a = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if abs(speed - 1.0) < 1e-3 or a.size < 32:
+        return a
+    import librosa
+    return librosa.effects.time_stretch(a, rate=speed)
 
 
 @app.get("/health")
@@ -110,6 +122,7 @@ def tts(req: TTSRequest):
             ):
                 if audio is None or len(audio) == 0:
                     continue
+                audio = _stretch(audio, req.speed)
                 if gen_ttfc_ms is None:
                     gen_ttfc_ms = (time.perf_counter() - t0) * 1000.0
                 n_samples += len(audio)
@@ -165,6 +178,10 @@ if __name__ == "__main__":
         text="Warm up.", speaker=args.warmup_speaker, language="English", chunk_size=4
     ):
         pass
+
+    # Warm librosa/numba JIT now so the first time-stretch doesn't compile (10-30s)
+    # mid-request and trip the watchdog.
+    _stretch(np.zeros(24000, dtype=np.float32), 1.15)
 
     threading.Thread(target=_lock_watchdog, daemon=True).start()
     print(f"READY — streaming TTS on :{args.port} (sr={SR})", flush=True)
