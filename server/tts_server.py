@@ -60,9 +60,11 @@ def _lock_watchdog():
 
 class TTSRequest(BaseModel):
     text: str
-    speaker: str = "ryan"
+    speaker: str = "uncle_fu"
     language: str = "English"
-    chunk_size: int = 4  # ~333 ms/chunk; smaller = lower time-to-first-audio
+    chunk_size: int = 4   # ~333 ms/chunk; smaller = lower time-to-first-audio
+    temperature: float = 0.4  # talker sampling: lower = more consistent prosody, less expressive (0.9 default)
+    top_k: int = 50
 
 
 def _to_pcm16(audio) -> bytes:
@@ -103,6 +105,8 @@ def tts(req: TTSRequest):
                 speaker=req.speaker,
                 language=req.language,
                 chunk_size=req.chunk_size,
+                temperature=req.temperature,
+                top_k=req.top_k,
             ):
                 if audio is None or len(audio) == 0:
                     continue

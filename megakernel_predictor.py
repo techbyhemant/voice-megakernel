@@ -62,11 +62,13 @@ class _PredKernel:
 
 class MegakernelPredictorGraph:
     """Drop-in for faster_qwen3_tts PredictorGraph using the megakernel backbone."""
-    def __init__(self, base_predictor_graph):
+    def __init__(self, base_predictor_graph, temperature=0.4):
         pg = base_predictor_graph
         self.sm = pg.small_to_mtp; self.heads = pg.lm_heads; self.embeds = pg.codec_embeds
         self.ncb = pg.num_codebooks
-        self.temperature = pg.temperature; self.top_k = pg.top_k; self.top_p = pg.top_p; self.do_sample = pg.do_sample
+        # Predictor codebook sampling. Lowered from the 0.9 default for consistent
+        # delivery (less timbre/prosody drift between utterances).
+        self.temperature = temperature; self.top_k = pg.top_k; self.top_p = pg.top_p; self.do_sample = pg.do_sample
         self.pk = _PredKernel(pg.pred_model, pg.num_layers)
         self.out = torch.zeros(self.ncb, dtype=torch.long, device="cuda")
         self.captured = True
