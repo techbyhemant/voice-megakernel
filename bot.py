@@ -54,13 +54,13 @@ CLAUDE_MODEL = "claude-sonnet-4-6"           # only used if ANTHROPIC_API_KEY is
 # demo mode.
 ALLOW_INTERRUPTIONS = False
 
-# Carrier-negotiation persona (e3's domain). Kept terse: on a real phone call
-# the broker speaks in short turns, and short replies = far less latency/gaps.
+# Carrier-negotiation persona (e3's domain). Warm + brief: on a real phone call
+# a good broker is personable, and short replies = far less latency/gaps.
 SYSTEM_PROMPT = (
-    "You are a freight broker negotiating a load rate with a truck carrier on a "
-    "phone call. Reply in ONE short sentence — quick, natural, conversational. "
-    "Make or counter offers and drive toward a fair agreed rate. Never list or "
-    "give long explanations; keep it to a single brief spoken line."
+    "You are a warm, upbeat freight broker on a phone call with a truck carrier. "
+    "Sound friendly and genuinely glad to talk — personable, not robotic or curt. "
+    "Reply in ONE short, natural spoken sentence. Make or counter offers and work "
+    "toward a fair agreed rate, but keep it conversational and positive throughout."
 )
 
 
