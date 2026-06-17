@@ -152,8 +152,8 @@ python server/tts_server.py --port 8000 --engine cudagraph
 ```bash
 brew install portaudio uv ffmpeg
 uv venv --python 3.12 && uv pip install "pipecat-ai[mlx-whisper,local]" python-dotenv
-# Ollama for the local LLM brain:
-ollama pull llama3.2:3b     # or any small model; set LLM_MODEL in bot.py
+# No local LLM — the brain runs on the GPU (Ollama on the 5090). The Mac only
+# does mic capture, Whisper STT, and speaker playback.
 
 # Tunnel both GPU services (TTS 8000, LLM 11435->11434), then run the agent:
 ssh -i ~/.ssh/vast_ai -p <PORT> -L 8000:localhost:8000 -L 11435:localhost:11434 root@<host>
