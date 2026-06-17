@@ -53,7 +53,7 @@ CLAUDE_MODEL = "claude-sonnet-4-6"           # only used if ANTHROPIC_API_KEY is
 #           cleanly (lock release + watchdog), so this is now safe end-to-end.
 #   False = mute the mic while the bot speaks (speaker-safe, strict turn-taking).
 # Use headphones with True; switch to False if you must demo on speakers.
-ALLOW_INTERRUPTIONS = True
+ALLOW_INTERRUPTIONS = False
 
 # Carrier-negotiation persona (e3's domain). Warm + brief: on a real phone call
 # a good broker is personable, and short replies = far less latency/gaps.

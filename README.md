@@ -254,6 +254,22 @@ no-recompile predictor reuse.
   (stop the server first). `--engine/--predictor cudagraph` remain available as
   per-stage fallbacks. The robust fix is to lower `LDG_NUM_BLOCKS` so the kernel
   co-resides even under contention.
+- **Interruptions (barge-in) — implemented, off by default on a single GPU.**
+  The `/tts` endpoint is async and cancels an in-flight reply within ~150 ms of a
+  barge-in (client disconnect → `request.is_disconnected()` → GPU-lock release),
+  so functionally it works. But with the LLM (Ollama) and the megakernel sharing
+  *one* GPU, a barge-in compresses a new LLM decode and the next TTS launch to
+  within ~10 ms of each other, and the megakernel's cooperative launch (above)
+  can't get all its SMs → it spins. So `bot.py` ships `ALLOW_INTERRUPTIONS =
+  False` (strict turn-taking runs clean). This is a *deployment* artifact, not an
+  architecture limit: the brain is **swappable** — set `ANTHROPIC_API_KEY` for an
+  API brain, and a remote brain leaves the GPU exclusively to the megakernel, so
+  barge-in works with no contention. The headline TTFC/RTF are GPU-compute
+  measured *during* generation, so they're identical either way — turn-taking vs.
+  barge-in is a UX layer on top, not part of the synthesis path. The single-GPU
+  fix *without* an API is a cross-process GPU lease that both the TTS server and
+  an LLM proxy acquire (serializes brain and kernel; not worth the handoff latency
+  here).
 - **TTFC over the network:** box-local TTFC is 53–63 ms, but end-to-end over the
   SSH tunnel is ~590 ms — dominated by network round-trip + per-request HTTP
   setup, not compute. A persistent connection / co-locating the client would
