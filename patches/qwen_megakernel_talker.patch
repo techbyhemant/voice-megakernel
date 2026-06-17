@@ -1,8 +1,26 @@
 diff --git a/csrc/kernel.cu b/csrc/kernel.cu
-index 217765b..40e58c4 100644
+index 217765b..3caca59 100644
 --- a/csrc/kernel.cu
 +++ b/csrc/kernel.cu
-@@ -1325,7 +1325,7 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
+@@ -1211,13 +1211,10 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
+   int block_id = blockIdx.x;
+   int num_blocks = gridDim.x;
+ 
+-  // Reset barrier counters + flags on-device
+-  if (block_id == 0 && threadIdx.x == 0) {
+-    *barrier_counter = 0;
+-    *barrier_sense = 0;
+-    atomicExch(kv_flag, 0u);
+-    atomicExch(attn_flag, 0u);
+-  }
++  // Barrier/flag state is zeroed HOST-SIDE before each launch (cudaMemsetAsync in
++  // the launch fn, stream-ordered before this kernel). The old in-kernel block-0
++  // reset raced the other blocks' atomicAdd below — it could wipe an increment so
++  // the counter never reached num_blocks -> infinite barrier spin. Removed.
+   __syncthreads();
+   if (threadIdx.x == 0) {
+     asm volatile("fence.acq_rel.gpu;" ::: "memory");
+@@ -1325,17 +1322,14 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
      unsigned int *__restrict__ barrier_sense,
      unsigned int *__restrict__ kv_flag, unsigned int *__restrict__ attn_flag,
      int num_layers, int position, int input_token_id, int max_seq_len,
@@ -11,7 +29,20 @@ index 217765b..40e58c4 100644
    int cache_len = position + 1;
    int block_id = blockIdx.x;
    int num_blocks = gridDim.x;
-@@ -1356,7 +1356,12 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
+ 
+-  if (block_id == 0 && threadIdx.x == 0) {
+-    *barrier_counter = 0;
+-    *barrier_sense = 0;
+-    atomicExch(kv_flag, 0u);
+-    atomicExch(attn_flag, 0u);
+-  }
++  // Barrier/flag state is zeroed HOST-SIDE before each launch (see launch fn).
++  // Removed the racy in-kernel block-0 reset (could wipe a block's atomicAdd ->
++  // barrier never completes -> infinite spin).
+   __syncthreads();
+   if (threadIdx.x == 0) {
+     asm volatile("fence.acq_rel.gpu;" ::: "memory");
+@@ -1356,7 +1350,12 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
    AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
                        1};
  
@@ -25,7 +56,7 @@ index 217765b..40e58c4 100644
  
    int kv_cache_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
  
-@@ -1482,7 +1487,8 @@ extern "C" void launch_ldg_decode_direct(
+@@ -1482,10 +1481,18 @@ extern "C" void launch_ldg_decode_direct(
      void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
      void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
      void *block_max_idxs, int num_layers, int position, int max_seq_len,
@@ -35,7 +66,17 @@ index 217765b..40e58c4 100644
    ldg_configure_kernel_attributes();
    ensure_barrier_alloc();
  
-@@ -1495,13 +1501,18 @@ extern "C" void launch_ldg_decode_direct(
++  // Re-arm the persistent barrier + flags host-side (stream-ordered before the
++  // kernel) instead of racing an in-kernel reset.
++  cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
++  cudaMemsetAsync(d_barrier_sense, 0, sizeof(unsigned int), stream);
++  cudaMemsetAsync(d_kv_flag, 0, sizeof(unsigned int), stream);
++  cudaMemsetAsync(d_attn_flag, 0, sizeof(unsigned int), stream);
++
+   ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+       (const __nv_bfloat16 *)embed_weight, layer_weights,
+       (const __nv_bfloat16 *)final_norm_weight,
+@@ -1495,13 +1502,18 @@ extern "C" void launch_ldg_decode_direct(
        (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
        (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
        d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
@@ -60,6 +101,22 @@ index 217765b..40e58c4 100644
  }
  
  extern "C" void launch_ldg_decode_persistent(
+@@ -1516,7 +1528,14 @@ extern "C" void launch_ldg_decode_persistent(
+   ldg_configure_kernel_attributes();
+   ensure_barrier_alloc();
+ 
+-  // Write mutable params via pinned host memory (barriers reset on-device)
++  // Re-arm the persistent barrier + flags host-side (stream-ordered before the
++  // kernel) instead of racing an in-kernel reset.
++  cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
++  cudaMemsetAsync(d_barrier_sense, 0, sizeof(unsigned int), stream);
++  cudaMemsetAsync(d_kv_flag, 0, sizeof(unsigned int), stream);
++  cudaMemsetAsync(d_attn_flag, 0, sizeof(unsigned int), stream);
++
++  // Write mutable params via pinned host memory
+   *h_pinned_position = position;
+   *h_pinned_token_id = input_token_id;
+   cudaMemcpyAsync(d_mutable_position, h_pinned_position, sizeof(int),
 diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
 index c7fd650..4c0a237 100644
 --- a/csrc/torch_bindings.cpp

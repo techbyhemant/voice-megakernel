@@ -244,17 +244,24 @@ streaming is true frame-by-frame (not buffered); reproducible kernel patch + a
 no-recompile predictor reuse.
 
 **Rough / known issues:**
-- **Megakernel startup contention:** the megakernel launches 128 *persistent
-  grid-synced* blocks that must all be co-resident on the SMs at once. If another
-  process is actively using the GPU *at launch* (e.g. Ollama loading weights, or
-  a server restart mid-flight), the blocks can't all schedule and the grid-sync
-  spins (GPU pegged, no progress). The dual-megakernel warmup launches the kernel
-  many more times, so it hits this more often — in practice **one server restart**
-  lands it on a settled GPU and it then runs reliably (verified live across the
-  streaming server + repeated requests). Benchmarks need the GPU **exclusive**
-  (stop the server first). `--engine/--predictor cudagraph` remain available as
-  per-stage fallbacks. The robust fix is to lower `LDG_NUM_BLOCKS` so the kernel
-  co-resides even under contention.
+- **Megakernel barrier re-arm race (root-caused + partially fixed).** The
+  persistent kernel intermittently hangs: GPU pegged at 100%, **no Xid** (so it's
+  not a fault — it's a live spin), one CPU thread busy-waiting. Debugged it to the
+  atomic grid barrier: block 0 re-armed `barrier_counter = 0` *in-kernel* with no
+  grid-wide ordering against the other 127 blocks' `atomicAdd(barrier_counter,1)`,
+  so a block that incremented before block 0's reset landed had its increment
+  wiped → the counter never reached `num_blocks` → `while (*vg == 0)` spins
+  forever. **Fix (in the patch):** zero the barrier/flag buffers **host-side**
+  (`cudaMemsetAsync`, stream-ordered before launch) and delete the racy in-kernel
+  reset. Cuts hangs ~5× (≈5 → ≈27 clean requests between hangs) with fidelity
+  intact (cosine 0.99926); the 5-layer predictor then ran **1500 launches clean**.
+  A **residual** hang remains in the talker's longer barrier chain (28 layers ≈ 84
+  barriers/launch vs the predictor's ~15 — which is why the talker still trips it),
+  and the rate is **GPU-state-sensitive**: on a fresh GPU it runs a full session
+  clean, but it worsens on a GPU that's accumulated many hard-killed CUDA contexts
+  (no in-container `nvidia-smi --gpu-reset`). Practically: a fresh instance + the
+  fix runs reliably; short/moderate takes complete; `--engine/--predictor cudagraph`
+  is the stable fallback (slower: ~80ms / 0.33). Benchmarks need the GPU exclusive.
 - **Interruptions (barge-in) — implemented, off by default on a single GPU.**
   The `/tts` endpoint is async and cancels an in-flight reply within ~150 ms of a
   barge-in (client disconnect → `request.is_disconnected()` → GPU-lock release),
