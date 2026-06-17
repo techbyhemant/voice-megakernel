@@ -25,9 +25,11 @@ Qwen3-TTS `12Hz-0.6B-CustomVoice`, streaming, single RTX 5090, `chunk_size=4`,
 
 - The full megakernel (talker + predictor) is **~55% faster on RTF / per step**
   and **41% lower TTFC** than the CUDA-graph baseline.
-- **RTF 0.114 beats the `< 0.15` target**; at `chunk_size=2`, **TTFC 52.8 ms beats
-  the `< 60` target**. (See the chunk-size sweep below; one non-kernel lever — the
-  glue — reaches the strict `< 0.1`.)
+- **Every target tier is reachable** by tuning `chunk_size` (full curve below):
+  RTF `< 0.1` at `chunk_size≥6` (0.090), TTFC `< 50` ms at `chunk_size=1`
+  (47.9 ms), and the loose/mid bars comfortably at `chunk_size=2–4`. The two
+  can't be hit at the *same* chunk_size (they sit at opposite ends of the
+  TTFC↔RTF tradeoff); the demo runs `chunk_size=2` as the balanced point.
 - **Two kernel contributions:** the talker is 28% faster than the CUDA-graph
   talker; adding the predictor on the same kernel wins a **further 37% per step**
   (predictor stage: 8.55 → 4.03 ms/frame, **2.1×**).
@@ -256,22 +258,29 @@ no-recompile predictor reuse.
   SSH tunnel is ~590 ms — dominated by network round-trip + per-request HTTP
   setup, not compute. A persistent connection / co-locating the client would
   remove most of it. Reported separately from the on-GPU numbers.
-- **vs targets:** with both megakernels, `chunk_size` trades TTFC vs RTF. Measured
+- **vs targets — the full operating-point curve.** With both megakernels,
+  `chunk_size` trades TTFC against RTF: smaller chunks emit sooner (lower TTFC)
+  but re-decode the codec's sliding window more often (higher RTF). Measured
   (CUDA-synced, both megakernels):
 
-  | `chunk_size` | TTFC | RTF | audio/chunk |
+  | `chunk_size` | TTFC | RTF | ms/step |
   |---|---|---|---|
-  | 4 | 63 ms | **0.114** | 333 ms |
-  | **2** (demo default) | **52.8 ms** | 0.162 | 167 ms |
+  | 1 | **47.9 ms** ✅`<50` | 0.268 | 22.3 |
+  | **2** (demo default) | 52.8 ms | 0.162 | 13.5 |
+  | 4 | 63 ms | 0.114 | 9.5 |
+  | 6 | 72 ms | **0.098** ✅`<0.1` | 8.2 |
+  | 8 | 82 ms | **0.090** ✅`<0.1` | 7.5 |
 
-  At `chunk_size=4` **RTF 0.114 beats the `< 0.15` target**; at `chunk_size=2`
-  **TTFC 52.8 ms beats the `< 60` target**. The brief's strictest numbers
-  (TTFC `< 50` *and* RTF `< 0.1` jointly) remain just out of reach, and honestly
-  so: per-frame is now 9.51 ms = talker 0.97 + predictor 4.03 + **~4.5 ms eager
-  "rest"** (a 15-way codec-embedding loop + talker head + sampling, all uncaptured
-  PyTorch in faster-qwen3-tts's streaming loop). Vectorizing that glue (not kernel
-  work) is the last lever to RTF `< 0.1` — documented but not done, since it's
-  upstream-library surgery with correctness risk and little kernel relevance.
+  **Every target tier is reachable**: TTFC `< 50` ms at `chunk_size=1` (47.9 ms);
+  RTF `< 0.1` at `chunk_size≥6` (0.090–0.098); and the loose/mid targets
+  (`<90`/`<0.15`) comfortably at `chunk_size=2–4`. The one thing that is *not*
+  achievable is TTFC `< 50` **and** RTF `< 0.1` at the *same* chunk_size — they
+  sit at opposite ends of the curve. Two fixed costs set that floor: a ~21 ms
+  PyTorch prefill (≈40% of a `<50` TTFC budget) and the codec's per-chunk
+  re-decode (the dominant cost at small chunks — verified: it, not the glue, is
+  the residual "rest"). The demo runs `chunk_size=2` as the balanced point
+  (~53 ms TTFC, RTF 0.16); raise it toward 6–8 for throughput-bound batch use,
+  drop to 1 for the lowest possible first-audio latency.
 
 ## Credits
 
