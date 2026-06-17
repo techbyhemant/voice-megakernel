@@ -113,7 +113,8 @@ def tts(req: TTSRequest):
         try:
             t0 = time.perf_counter()
             gen_ttfc_ms = None
-            n_samples = 0
+            nat_samples = 0      # model output, pre-stretch — the honest RTF basis
+            stretch_s = 0.0      # post-processing time, excluded from the model RTF
             for audio, _sr, _timing in MODEL.generate_custom_voice_streaming(
                 text=req.text,
                 speaker=req.speaker,
@@ -124,17 +125,22 @@ def tts(req: TTSRequest):
             ):
                 if audio is None or len(audio) == 0:
                     continue
-                audio = _stretch(audio, req.speed)
+                nat_samples += len(audio)
+                ts = time.perf_counter()
+                audio = _stretch(audio, req.speed)   # playback-speed post-proc (not model compute)
+                stretch_s += time.perf_counter() - ts
                 if gen_ttfc_ms is None:
                     gen_ttfc_ms = (time.perf_counter() - t0) * 1000.0
-                n_samples += len(audio)
                 yield _to_pcm16(audio)
             total_s = time.perf_counter() - t0
-            audio_s = n_samples / SR if SR else 0.0
+            nat_audio_s = nat_samples / SR if SR else 0.0
+            gen_s = total_s - stretch_s   # megakernel compute only; speed-stretch excluded
+            # RTF reflects the MODEL: compute vs the audio it generated (pre-stretch),
+            # so the playback-speed knob doesn't distort the megakernel metric.
             _last_metrics = {
                 "gen_ttfc_ms": round(gen_ttfc_ms, 1) if gen_ttfc_ms else None,
-                "gen_rtf": round(total_s / audio_s, 3) if audio_s else None,
-                "audio_s": round(audio_s, 2),
+                "gen_rtf": round(gen_s / nat_audio_s, 3) if nat_audio_s else None,
+                "audio_s": round(nat_audio_s, 2),
             }
         finally:
             # Watchdog may have already force-released it; guard the release.
