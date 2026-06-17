@@ -218,8 +218,22 @@ is true frame-by-frame (not buffered); reproducible kernel patch.
   SSH tunnel is ~700 ms — dominated by network round-trip + per-request HTTP
   setup, not compute. A persistent connection / co-locating the client would
   remove most of it. Reported separately from the on-GPU numbers.
-- **TTFC vs target:** 83.7 ms (megakernel, box-local) is under the 90 ms goal but
-  above the 50 ms stretch goal; smaller chunks lower it further at some RTF cost.
+- **TTFC vs target:** 83.7 ms (megakernel, box-local, `chunk_size=4`) is under the
+  90 ms goal. `chunk_size` is the dominant TTFC lever — fewer frames before the
+  first emit lowers TTFC at some RTF cost. Measured on the live megakernel server:
+
+  | `chunk_size` | TTFC | RTF | audio/chunk |
+  |---|---|---|---|
+  | 4 | 84 ms | 0.18 | 333 ms |
+  | **2** (demo default) | **64 ms** | 0.24 | 167 ms |
+  | 1 | 55 ms | 0.34 | 83 ms |
+
+  The demo runs `chunk_size=2` (64 ms, RTF 0.24 — well under the 1.0 real-time
+  ceiling). Below ~55 ms, chunk_size stops helping: you can't emit before one
+  frame + codec, and the remaining per-frame cost is the **code predictor (78%),
+  not the talker (22%)** — so the next lever would be megakernel-ing the predictor,
+  not the backbone. (Headline table above stays at `chunk_size=4` for an
+  apples-to-apples talker-engine comparison.)
 
 ## Credits
 
