@@ -1,0 +1,19 @@
+# Secrets — never commit
+.env
+
+# Python virtual environment (platform-specific; rebuilt on each machine)
+.venv/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Model / HF caches and scratch audio
+*.wav
+.cache/
+
+# Editor noise
+.DS_Store
+
+# Company take-home assignment — do NOT publish
+takehome_project.docx.md
