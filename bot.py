@@ -57,15 +57,29 @@ ALLOW_INTERRUPTIONS = False
 # Carrier-negotiation persona (e3's domain). Warm + brief: on a real phone call
 # a good broker is personable, and short replies = far less latency/gaps.
 SYSTEM_PROMPT = (
-    "You are a freight broker on a quick phone call with a truck carrier — warm and "
-    "friendly, but you talk like a real person on a call.\n"
-    "STRICT RULES:\n"
-    "- Reply with ONE sentence, 12 words or fewer. Never two sentences.\n"
-    "- Say ONE thing only: an offer, a counter, or a short question — then STOP so "
-    "they can answer.\n"
-    "- No speeches, no lists, no explanations. Keep the rate negotiation moving.\n"
-    "Example good replies: \"I can do one forty a mile, that work?\" / "
-    "\"Best I've got is one fifty-five.\" / \"Where you headed out of Dallas?\""
+    "You are Marcus, a sharp, friendly freight broker working the load board, live "
+    "on the phone with a truck carrier (driver or dispatcher). Your job: book this "
+    "load at a rate that protects your margin but gets the truck committed — close "
+    "the deal.\n\n"
+    "HOW YOU NEGOTIATE:\n"
+    "- Anchor a little low but realistic for the lane, then concede in small steps "
+    "toward a fair middle; don't cave all at once.\n"
+    "- Justify with the lane, miles, equipment, or market ('short haul', 'backhaul's "
+    "tight', 'fuel's up').\n"
+    "- Know your ceiling and don't blow past it; if they're reasonable, lock it in "
+    "fast and confirm the booking.\n"
+    "- Build rapport: warm, confident, easy to deal with.\n\n"
+    "REALISM: rates are dollars per mile (dry-van spot is ~$1.40–$2.10/mi depending "
+    "on lane); reference pickup, destination, miles, and equipment naturally.\n\n"
+    "OUTPUT RULES — this is a fast phone call, so:\n"
+    "- Reply with EXACTLY ONE sentence, 12 words or fewer. Never two sentences.\n"
+    "- Say ONE thing — an offer, a counter, or a short question — then STOP and let "
+    "them talk. No monologues, no lists, no thinking out loud.\n"
+    "GOOD EXAMPLES:\n"
+    "  'I can do one forty-five a mile, that work for you?'\n"
+    "  'Best I can stretch is one sixty, you in?'\n"
+    "  'Where's it delivering out of Dallas?'\n"
+    "  'Done — I'll send the rate con over now.'"
 )
 
 
@@ -79,6 +93,37 @@ def _build_brain():
         return AnthropicLLMService(api_key=key, model=CLAUDE_MODEL)
     print(f"Brain: Ollama ({LLM_MODEL}) on the 5090 via {REMOTE_LLM_BASE}")
     return OLLamaLLMService(model=LLM_MODEL, base_url=REMOTE_LLM_BASE)
+
+
+def _preload_brain():
+    """Preload the LLM before the first turn: send the (long, detailed) system
+    prompt once so Ollama loads the model AND caches its prefix KV. The system
+    prompt is a CONSTANT prefix on every turn, so Ollama reuses that cached KV —
+    the detailed prompt is prefilled once here, not re-processed each turn. Makes
+    turn 1 warm instead of cold (no ~1s first-token penalty mid-demo)."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key.startswith("sk-ant-") and "REPLACE" not in key and "oat01" not in key:
+        return  # Claude path: provider handles caching; nothing to preload locally
+    import json
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            REMOTE_LLM_BASE.rstrip("/") + "/chat/completions",
+            data=json.dumps({
+                "model": LLM_MODEL,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": "hi"},
+                ],
+                "max_tokens": 1,
+                "stream": False,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=30)
+        print("Brain preloaded — system prompt cached on the GPU (turn 1 is warm)")
+    except Exception as e:
+        print(f"(brain preload skipped: {e})")
 
 
 async def main():
@@ -97,6 +142,7 @@ async def main():
     # --- The four stations ------------------------------------------------
     stt = WhisperSTTServiceMLX(model=MLXModel.LARGE_V3_TURBO)     # ears (runs on M4 GPU via MLX)
     llm = _build_brain()                                         # brain (Claude or local)
+    _preload_brain()                                             # warm + cache the system prompt on the GPU
     tts = RemoteQwenTTSService()                                 # mouth (streams from 5090 over SSH tunnel)
 
     # The LLM needs "memory" of the conversation. The context holds the running
