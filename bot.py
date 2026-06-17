@@ -39,12 +39,6 @@ from pipecat.transports.local.audio import (
 
 from remote_tts_service import RemoteQwenTTSService
 
-# Quiet Pipecat's DEBUG flood so the demo terminal shows only key lines + 📊 metrics.
-import sys
-from loguru import logger
-logger.remove()
-logger.add(sys.stderr, level="INFO")
-
 # Brain runs on the 5090 (Ollama), reached over the SSH tunnel — keyless and on
 # the reimbursed GPU. Tunnel maps local 11435 -> box 11434 (avoids clashing with
 # any Ollama on the Mac). Claude is OPTIONAL (set ANTHROPIC_API_KEY; billed to you).
