@@ -1,17 +1,22 @@
 """
-bot.py — local voice agent: mic -> Whisper -> local LLM -> Qwen3-TTS -> speaker.
+bot.py — freight-carrier-negotiation voice agent:
+    mic -> Whisper (STT) -> LLM brain -> Qwen3-TTS (5090) -> speaker.
 
-Fully local, no API keys. The brain runs on Ollama; the voice is Qwen3-TTS.
-The whole pipeline is self-contained (same shape we'll deploy on the 5090,
-where the Qwen3-TTS talker decode gets swapped for the CUDA megakernel).
+The negotiation brain is a SWAPPABLE LLM. In production you'd use a frontier
+model for negotiation quality; this defaults to Claude when ANTHROPIC_API_KEY is
+set, and falls back to a local Ollama model (keyless, lower quality) otherwise.
+The engineering contribution is the real-time TTS (megakernel talker on the 5090).
 
 Run it with:
     ./run.sh        (or: ./.venv/bin/python bot.py)
-
-Then just talk. Pause, and the bot replies out loud.
 """
 
 import asyncio
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()  # ANTHROPIC_API_KEY (brain), etc.
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -24,6 +29,7 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.turns.user_mute import AlwaysUserMuteStrategy
+from pipecat.services.anthropic.llm import AnthropicLLMService
 from pipecat.services.ollama.llm import OLLamaLLMService
 from pipecat.services.whisper.stt import MLXModel, WhisperSTTServiceMLX
 from pipecat.transports.local.audio import (
@@ -32,23 +38,37 @@ from pipecat.transports.local.audio import (
 )
 
 from remote_tts_service import RemoteQwenTTSService
-# from qwen_tts_service import Qwen3TTSService  # local in-process baseline (slow, Mac CPU)
 
-# The local chat brain. Any model you've pulled with `ollama pull <name>` works.
-# qwen2.5vl:3b is already on this machine; llama3.2:3b is a leaner text-only swap.
-LLM_MODEL = "qwen2.5vl:3b"
+# Brain runs on the 5090 (Ollama), reached over the SSH tunnel — keyless and on
+# the reimbursed GPU. Tunnel maps local 11435 -> box 11434 (avoids clashing with
+# any Ollama on the Mac). Claude is OPTIONAL (set ANTHROPIC_API_KEY; billed to you).
+LLM_MODEL = "qwen2.5:7b-instruct"            # served by Ollama on the 5090
+REMOTE_LLM_BASE = "http://localhost:11435/v1"
+CLAUDE_MODEL = "claude-sonnet-4-6"           # only used if ANTHROPIC_API_KEY is set
 
-# Barge-in control:
-#   False -> mic is muted while the bot speaks. No interruptions, but safe on
-#            laptop SPEAKERS (bot can't hear itself). Good for quick testing.
-#   True  -> you can interrupt the bot mid-sentence (real-time feel). REQUIRES
-#            HEADPHONES (or echo cancellation), else the bot hears its own voice.
+# Barge-in control: False mutes the mic while the bot speaks (speaker-safe, no
+# interruptions). True allows barge-in but needs headphones / echo cancellation.
 ALLOW_INTERRUPTIONS = False
 
+# Carrier-negotiation persona (e3's domain: voice freight brokerage).
 SYSTEM_PROMPT = (
-    "You are a friendly voice assistant. Keep replies short and conversational "
-    "— one or two sentences — since they will be spoken aloud."
+    "You are a freight brokerage voice agent negotiating a load with a truck "
+    "carrier over the phone. Be concise, natural, and professional — one or two "
+    "sentences per turn, since you are speaking aloud. Acknowledge the carrier, "
+    "make and counter offers, and work toward a fair agreed rate for the load."
 )
+
+
+def _build_brain():
+    """LLM brain on the 5090 via Ollama (over the tunnel) by default — keyless,
+    on the reimbursed GPU. Claude only if a real ANTHROPIC_API_KEY is set
+    (API cost is on you, not reimbursed)."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key.startswith("sk-ant-") and "REPLACE" not in key and "oat01" not in key:
+        print(f"Brain: Claude ({CLAUDE_MODEL}) — billed to your account")
+        return AnthropicLLMService(api_key=key, model=CLAUDE_MODEL)
+    print(f"Brain: Ollama ({LLM_MODEL}) on the 5090 via {REMOTE_LLM_BASE}")
+    return OLLamaLLMService(model=LLM_MODEL, base_url=REMOTE_LLM_BASE)
 
 
 async def main():
@@ -66,7 +86,7 @@ async def main():
 
     # --- The four stations ------------------------------------------------
     stt = WhisperSTTServiceMLX(model=MLXModel.LARGE_V3_TURBO)     # ears (runs on M4 GPU via MLX)
-    llm = OLLamaLLMService(model=LLM_MODEL)                       # brain (local, no key)
+    llm = _build_brain()                                         # brain (Claude or local)
     tts = RemoteQwenTTSService()                                 # mouth (streams from 5090 over SSH tunnel)
 
     # The LLM needs "memory" of the conversation. The context holds the running

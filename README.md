@@ -27,6 +27,24 @@ Qwen3-TTS `12Hz-0.6B-CustomVoice`, streaming, single RTX 5090, `chunk_size=4`,
 - Talker output matches the PyTorch talker at **cosine 0.9997** (single- and
   multi-step, see `megakernel_talker.py`).
 
+## Why this matters (freight voice negotiation)
+
+e3 negotiates loads with carriers **over the phone**. On a live call, the agent's
+responsiveness *is* the product: a human expects a reply to begin within a couple
+hundred milliseconds, or the bot feels robotic, kills rapport, and loses the
+negotiation. So **time-to-first-audio (TTFC) is the metric that maps to call
+quality** — not raw throughput.
+
+That's why this kernel work matters here: it cuts TTFC from 107 ms to **83.7 ms**,
+under the ~90 ms bar where turn-taking feels natural. The codec and code-predictor
+were already fast (CUDA graphs); the **talker backbone was the remaining lever**,
+and the megakernel is the fastest way to pull it.
+
+Product judgment also shaped what we *didn't* build: **no GUI** (the interface is
+the voice), and STT/LLM are **swappable off-the-shelf parts** — the engineering
+investment went into the one component that actually moves the customer-facing
+latency.
+
 ## Where the time goes (bottleneck analysis)
 
 Profiling the naive PyTorch path (per decode step) showed the surprising split:
@@ -46,22 +64,28 @@ megakernel the talker.**
 ## Architecture
 
 ```
-   YOUR MAC (mic + speaker)                 RENTED RTX 5090 (TTS server)
-┌──────────────────────────────┐        ┌────────────────────────────────────┐
-│ mic → Whisper(MLX) → LLM      │  text  │  POST /tts → streaming PCM           │
-│        (Ollama)               │ ─────► │   faster-qwen3-tts generate loop:    │
-│            │                  │        │     prefill (PyTorch)                │
-│            ▼  RemoteQwenTTS    │        │     loop: talker step ──► MEGAKERNEL │
-│ speaker ◄── audio chunks ◄─────────────│           code predictor (CUDA graph)│
-└──────────────────────────────┘  PCM   │           codec → audio chunk        │
-        (over SSH tunnel)                └────────────────────────────────────┘
+   YOUR MAC (mic + speaker)            RENTED RTX 5090 (all compute)
+┌────────────────────────────┐     ┌──────────────────────────────────────────┐
+│ mic → Whisper (MLX STT)     │     │  Ollama LLM (qwen2.5:7b-instruct)          │
+│           │ text            │ ──► │        │  negotiation reply                │
+│           ▼                 │ ◄── │        ▼                                   │
+│    RemoteQwenTTS ───────────────► │  Qwen3-TTS streaming:                      │
+│ speaker ◄── audio chunks ◄────────│   talker step ─► MEGAKERNEL                │
+└────────────────────────────┘ PCM │   code predictor (CUDA graph) · codec      │
+   SSH tunnel: 8000 (TTS),          └──────────────────────────────────────────┘
+               11435→11434 (LLM)
 ```
 
-- **STT / LLM** run on the Mac (off-the-shelf). The LLM is any local Ollama model.
-- **TTS** is a streaming server on the 5090 (brief's Step 2); the Mac connects
-  over an SSH tunnel (brief's Step 3).
-- Inside the TTS, the **talker's per-step decode** is the megakernel; the **code
+- The **Mac** is the thin audio client: microphone, Whisper STT, speaker. (Audio
+  I/O must live where the human is; the GPU box is headless.)
+- **All compute runs on the 5090** — the LLM (Ollama) *and* the TTS — reached
+  over an SSH tunnel. This is the brief's Step 2 (inference server) + Step 3
+  (Pipecat integration).
+- Inside the TTS: the **talker's per-step decode is the megakernel**; the **code
   predictor** is a captured CUDA graph; the **codec** is PyTorch.
+- The **LLM brain is swappable** — Ollama on the GPU by default (free, on the
+  reimbursed GPU); set `ANTHROPIC_API_KEY` to use Claude instead (better
+  negotiation quality, but billed to you — API cost isn't reimbursed).
 
 ## Kernel modifications
 
@@ -114,7 +138,12 @@ git apply /path/to/patches/qwen_megakernel_talker.patch && cd ..
 pip install qwen-tts faster-qwen3-tts fastapi "uvicorn[standard]"
 export HF_TOKEN=hf_...     # free read-only token (avoids HF rate-limiting)
 
-# 4. Start the streaming TTS server (cudagraph = reliable; megakernel = faster)
+# 4. LLM on the GPU (Ollama) — keyless, on the reimbursed GPU
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve &                       # run in tmux/background
+ollama pull qwen2.5:7b-instruct
+
+# 5. Streaming TTS server (cudagraph = reliable; megakernel = faster, see notes)
 python server/tts_server.py --port 8000 --engine cudagraph
 ```
 
@@ -126,10 +155,12 @@ uv venv --python 3.12 && uv pip install "pipecat-ai[mlx-whisper,local]" python-d
 # Ollama for the local LLM brain:
 ollama pull llama3.2:3b     # or any small model; set LLM_MODEL in bot.py
 
-# Tunnel the server port, then run the agent:
-ssh -i ~/.ssh/vast_ai -p <PORT> -L 8000:localhost:8000 root@<host>   # keep open
+# Tunnel both GPU services (TTS 8000, LLM 11435->11434), then run the agent:
+ssh -i ~/.ssh/vast_ai -p <PORT> -L 8000:localhost:8000 -L 11435:localhost:11434 root@<host>
 ./run.sh
 ```
+(Non-Mac clients: swap `WhisperSTTServiceMLX` → `WhisperSTTService` (faster-whisper)
+in `bot.py`; STT is the only Mac-specific piece.)
 
 Talk, pause, and the agent replies in the Qwen3-TTS voice.
 
@@ -143,6 +174,27 @@ python benchmarks/bench_tts.py --engine megakernel --runs 7
 Multi-run, CUDA-synced, reports median/p90/min/max for TTFC, RTF, ms/step across
 short/medium/long texts. The `chunk_size` knob trades TTFC vs RTF (chunk 4:
 TTFC 107 ms / RTF 0.25; chunk 12: TTFC 232 ms / RTF 0.22 on the CUDA-graph path).
+
+## Observability
+
+A phone agent fails *quietly* — audio just gets laggy or choppy — so you
+instrument the signals that map to call quality:
+
+- **Live per-turn metrics:** the agent prints `TTFC`, `RTF`, and audio duration
+  for every reply (`remote_tts_service.py`), so degradation is visible *as it
+  happens*, not in a post-mortem.
+- **What you'd monitor in production:**
+  - **TTFC p50/p99** — the turn-taking latency a caller feels (alert if p99 climbs).
+  - **RTF** — must stay < 1.0 or audio stutters (alert as it approaches 1.0).
+  - **STT / LLM / TTS latency breakdown** — pinpoint which stage caused a slow turn.
+  - **Dropped/late audio frames, GPU utilization, error rate** — health + capacity.
+- **Offline rigor:** `benchmarks/bench_tts.py` reports median/p90/min/max over
+  multiple runs and text lengths — the same discipline applied offline that the
+  live metrics apply online.
+
+Note: live end-to-end TTFC includes network round-trip (hundreds of ms over the
+SSH tunnel); the **on-GPU 84 ms** is the compute figure a co-located deployment
+would see.
 
 ## What works, what's rough (honest)
 
