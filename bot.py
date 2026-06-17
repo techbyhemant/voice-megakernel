@@ -31,7 +31,8 @@ from pipecat.transports.local.audio import (
     LocalAudioTransportParams,
 )
 
-from qwen_tts_service import Qwen3TTSService
+from remote_tts_service import RemoteQwenTTSService
+# from qwen_tts_service import Qwen3TTSService  # local in-process baseline (slow, Mac CPU)
 
 # The local chat brain. Any model you've pulled with `ollama pull <name>` works.
 # qwen2.5vl:3b is already on this machine; llama3.2:3b is a leaner text-only swap.
@@ -66,7 +67,7 @@ async def main():
     # --- The four stations ------------------------------------------------
     stt = WhisperSTTServiceMLX(model=MLXModel.LARGE_V3_TURBO)     # ears (runs on M4 GPU via MLX)
     llm = OLLamaLLMService(model=LLM_MODEL)                       # brain (local, no key)
-    tts = Qwen3TTSService()                                      # mouth (REAL Qwen3-TTS)
+    tts = RemoteQwenTTSService()                                 # mouth (streams from 5090 over SSH tunnel)
 
     # The LLM needs "memory" of the conversation. The context holds the running
     # message list; the aggregator pair feeds user turns in and records the
