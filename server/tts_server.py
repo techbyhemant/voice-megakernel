@@ -44,8 +44,8 @@ class TTSRequest(BaseModel):
     speaker: str = "uncle_fu"
     language: str = "English"
     chunk_size: int = 2   # ~333 ms/chunk; smaller = lower time-to-first-audio
-    temperature: float = 0.4  # talker sampling: lower = more consistent prosody, less expressive (0.9 default)
-    top_k: int = 50
+    temperature: float = 0.3  # talker sampling: lower = more consistent pace/energy, fewer whisper/slow takes (0.9 default)
+    top_k: int = 20           # tighter sampling -> less prosody drift between utterances
     speed: float = 1.15   # pitch-preserving playback speed (1.0 = natural); model has no rate knob
 
 
@@ -240,8 +240,10 @@ if __name__ == "__main__":
         print("Talker engine -> MEGAKERNEL", flush=True)
     if args.predictor == "megakernel":
         from megakernel_predictor import MegakernelPredictorGraph
-        MODEL.predictor_graph = MegakernelPredictorGraph(MODEL.predictor_graph)
-        print("Predictor engine -> MEGAKERNEL (2.1x)", flush=True)
+        # temperature=0.3 on the predictor too: keeps timbre/detail consistent across
+        # utterances (matches the talker temperature), reducing voice drift.
+        MODEL.predictor_graph = MegakernelPredictorGraph(MODEL.predictor_graph, temperature=0.3)
+        print("Predictor engine -> MEGAKERNEL (2.1x, temp=0.3)", flush=True)
 
     if args.compile_codec == "on":
         # The codec (speech-tokenizer decoder) is launch-overhead-bound: ~16 ms/call
