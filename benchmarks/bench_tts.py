@@ -80,10 +80,19 @@ def main():
     ap.add_argument("--chunk-size", type=int, default=4)
     ap.add_argument("--runs", type=int, default=7)
     ap.add_argument("--lengths", default="short,medium,long")
+    ap.add_argument("--engine", default="cudagraph", choices=["cudagraph", "megakernel"])
     args = ap.parse_args()
 
-    print(f"Loading {args.model} ...", flush=True)
+    print(f"Loading {args.model} (engine={args.engine}) ...", flush=True)
     model = FasterQwen3TTS.from_pretrained(args.model)
+
+    if args.engine == "megakernel":
+        import sys
+        sys.path.insert(0, "/workspace")
+        from megakernel_talker import MegakernelTalkerGraph
+        base = model.talker_graph.model
+        model.talker_graph = MegakernelTalkerGraph(base, base.config)
+        print("Swapped talker to MEGAKERNEL", flush=True)
 
     print("Warmup (capture CUDA graphs, 2 runs)...", flush=True)
     for _ in range(2):
