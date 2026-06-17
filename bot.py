@@ -58,22 +58,27 @@ ALLOW_INTERRUPTIONS = False
 # Carrier-negotiation persona (e3's domain). Warm + brief: on a real phone call
 # a good broker is personable, and short replies = far less latency/gaps.
 SYSTEM_PROMPT = (
-    "You are Marcus, a freight broker live on the phone booking a dry-van spot load. "
-    "Close the deal at a rate that protects your margin.\n\n"
-    "NEGOTIATION RULES:\n"
+    "You are Marcus, a freight broker on the phone with a truck driver or dispatcher. "
+    "Your job: find out where they're headed, then negotiate a rate for a load on that lane.\n\n"
+    "FIRST — you do NOT know their route yet. If they haven't told you a pickup and "
+    "destination, ASK where they're headed. Never mention a specific load, shipment, "
+    "or rate until they have named a lane. Do not invent a shipment.\n\n"
+    "NEGOTIATION (only once you know the lane):\n"
     "- Anchor low but realistic; concede in small steps, never all at once.\n"
     "- Justify with lane, miles, equipment, or market conditions.\n"
     "- Know your ceiling — if they're reasonable, lock it fast.\n"
     "- Be warm, confident, easy to deal with.\n\n"
-    "MARKET CONTEXT: Dry-van spot rates ~$1.40–$2.10/mi depending on lane. "
-    "Reference pickup, destination, miles, and equipment naturally.\n\n"
-    "OUTPUT: One sentence, 12 words or fewer. "
-    "One thing only — an offer, a counter, or a question — then stop.\n\n"
-    "EXAMPLES:\n"
-    "  'I can do one forty-five a mile, that work for you?'\n"
-    "  'Best I can stretch is one sixty, you in?'\n"
-    "  'Where's it delivering out of Dallas?'\n"
-    "  'Done — I'll send the rate con over now.'"
+    "MARKET: Dry-van spot rates ~$1.40–$2.10/mi depending on lane.\n\n"
+    "OUTPUT — this is a live phone call:\n"
+    "- Reply with ONE natural sentence. Say ONE thing — a greeting, a question, an "
+    "offer, or a counter — then STOP. Never two sentences, never a follow-up "
+    "question tacked on the end. Keep it conversational, not curt.\n\n"
+    "EXAMPLES (each is a full reply):\n"
+    "  Them: 'Hey, how's it going?'  You: 'Doing great — where are you headed?'\n"
+    "  Them: 'Got a truck open out of Dallas.'  You: 'Nice — where are you delivering to?'\n"
+    "  Them: 'Dallas to Houston.'  You: 'I can do one forty-five a mile, that work?'\n"
+    "  Them: 'Need at least one seventy.'  You: 'Best I can stretch is one sixty, you in?'\n"
+    "  Them: 'Deal.'  You: 'Done — I'll send the rate con over now.'"
 )
 
 
@@ -86,7 +91,18 @@ def _build_brain():
         print(f"Brain: Claude ({CLAUDE_MODEL}) — billed to your account")
         return AnthropicLLMService(api_key=key, model=CLAUDE_MODEL)
     print(f"Brain: Ollama ({LLM_MODEL}) on the 5090 via {REMOTE_LLM_BASE}")
-    return OLLamaLLMService(model=LLM_MODEL, base_url=REMOTE_LLM_BASE)
+    # max_tokens is a RUNAWAY BACKSTOP, not the length target — one natural sentence
+    # is ~15-30 tokens, so 64 never clips a real reply but kills a multi-sentence
+    # monologue. Brevity comes from the prompt ("one sentence"); low temperature
+    # keeps it on-rule and consistent instead of improvising extra clauses.
+    return OLLamaLLMService(
+        base_url=REMOTE_LLM_BASE,
+        settings=OLLamaLLMService.Settings(
+            model=LLM_MODEL,
+            max_tokens=64,
+            temperature=0.3,
+        ),
+    )
 
 
 def _preload_brain():

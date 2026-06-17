@@ -62,7 +62,7 @@ class TTSRequest(BaseModel):
     text: str
     speaker: str = "uncle_fu"
     language: str = "English"
-    chunk_size: int = 4   # ~333 ms/chunk; smaller = lower time-to-first-audio
+    chunk_size: int = 2   # ~333 ms/chunk; smaller = lower time-to-first-audio
     temperature: float = 0.4  # talker sampling: lower = more consistent prosody, less expressive (0.9 default)
     top_k: int = 50
     speed: float = 1.15   # pitch-preserving playback speed (1.0 = natural); model has no rate knob

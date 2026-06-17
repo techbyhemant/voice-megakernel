@@ -99,11 +99,11 @@ class RemoteQwenTTSService(TTSService):
             gen = {}
             try:
                 async with session.get(self._metrics_url) as r:
-                    gen = await r.json()
+                    gen = (await r.json()) or {}
             except Exception:
                 pass
         print(
-            f"📊 [TTS] compute(GPU): TTFC={gen.get('gen_ttfc_ms')}ms RTF={gen.get('gen_rtf')}  |  "
+            f"📊 [TTS] compute(GPU): TTFC={gen.get('gen_ttfc_ms', 'n/a')}ms RTF={gen.get('gen_rtf', 'n/a')}  |  "
             f"end-to-end(+net): TTFC={ttfc_ms:.0f}ms RTF={rtf:.2f}  audio={audio_s:.2f}s  "
             f"«{text[:40]}»",
             flush=True,
