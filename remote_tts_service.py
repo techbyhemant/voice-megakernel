@@ -93,6 +93,8 @@ class RemoteQwenTTSService(TTSService):
             total_s = time.perf_counter() - t0
             audio_s = n_bytes / (SAMPLE_RATE * 2)  # 16-bit mono
             rtf = (total_s / audio_s) if audio_s else float("nan")
+            if ttfc_ms is None:
+                ttfc_ms = 0.0  # no audio received from server
             # Server-side COMPUTE metrics (no network) for the same utterance.
             gen = {}
             try:
