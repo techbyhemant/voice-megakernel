@@ -18,12 +18,13 @@ Run:  /venv/main/bin/python tts_server.py --port 8000
 """
 
 import argparse
+import asyncio
 import threading
 import time
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -35,27 +36,6 @@ MODEL = None
 SR = 24000
 _gpu_lock = threading.Lock()  # serialize GPU inference (one utterance at a time)
 _last_metrics = {}            # compute-only metrics of the most recent utterance
-_lock_held_since = None       # monotonic time the lock was acquired (None = free)
-WEDGE_TIMEOUT = 60.0          # > any real reply (incl. long ones + stretch); longer => parked/wedged
-
-
-def _lock_watchdog():
-    """A disconnected streaming response leaves its sync generator parked at
-    `yield` STILL holding the GPU lock (Starlette doesn't close it), which would
-    wedge every later request. If the lock is held longer than any real
-    utterance, force-release it. threading.Lock isn't thread-owned, so another
-    thread may release it."""
-    global _lock_held_since
-    while True:
-        time.sleep(2.0)
-        held = _lock_held_since
-        if held is not None and (time.monotonic() - held) > WEDGE_TIMEOUT:
-            _lock_held_since = None
-            try:
-                _gpu_lock.release()
-                print("WATCHDOG: force-released a wedged GPU lock", flush=True)
-            except RuntimeError:
-                pass
 
 
 class TTSRequest(BaseModel):
@@ -98,31 +78,56 @@ def metrics():
     return JSONResponse(_last_metrics)
 
 
+_SENTINEL = object()  # distinct from a yielded (None, ...) chunk
+
+
 @app.post("/tts")
-def tts(req: TTSRequest):
-    def generate():
+async def tts(req: TTSRequest, request: Request):
+    """Stream TTS with INTERACTIVE barge-in support.
+
+    Earlier this was a sync generator. On a client disconnect (barge-in),
+    Starlette runs sync generators in a threadpool and does NOT reliably throw
+    GeneratorExit into them — so it parked at `yield` holding the GPU lock, and
+    the next turn blocked 30 s on acquire(). That made interruptions unusable.
+
+    Now it's async: we drive the blocking model generator one chunk at a time in
+    the threadpool and check `request.is_disconnected()` between chunks. On
+    barge-in we stop within ~one chunk (~150 ms), close the generator, and
+    release the lock IMMEDIATELY in `finally` — so the next turn never waits.
+    """
+    loop = asyncio.get_running_loop()
+
+    async def generate():
         global _last_metrics
-        # Serialize GPU inference (one utterance at a time) so concurrent
-        # requests don't corrupt shared state. CRITICAL: acquire with a timeout
-        # and release in `finally`, so an interrupted turn (client disconnect ->
-        # GeneratorExit) can't leave the lock held and wedge every later request.
-        global _lock_held_since
-        if not _gpu_lock.acquire(timeout=30):
-            return  # a prior request is wedged; fail fast instead of hanging
-        _lock_held_since = time.monotonic()
+        # Acquire off the event loop so a busy GPU can't stall the whole server.
+        # timeout=30 fast-fails (returns empty) instead of hanging forever if a
+        # prior request is genuinely wedged on the GPU.
+        got = await loop.run_in_executor(None, lambda: _gpu_lock.acquire(timeout=30))
+        if not got:
+            return
+        gen = None
         try:
             t0 = time.perf_counter()
             gen_ttfc_ms = None
             nat_samples = 0      # model output, pre-stretch — the honest RTF basis
             stretch_s = 0.0      # post-processing time, excluded from the model RTF
-            for audio, _sr, _timing in MODEL.generate_custom_voice_streaming(
+            gen = MODEL.generate_custom_voice_streaming(
                 text=req.text,
                 speaker=req.speaker,
                 language=req.language,
                 chunk_size=req.chunk_size,
                 temperature=req.temperature,
                 top_k=req.top_k,
-            ):
+            )
+            while True:
+                # Barge-in check BEFORE spending a chunk of GPU time.
+                if await request.is_disconnected():
+                    break
+                # One model chunk in the threadpool (CUDA releases the GIL).
+                item = await loop.run_in_executor(None, lambda: next(gen, _SENTINEL))
+                if item is _SENTINEL:
+                    break
+                audio, _sr, _timing = item
                 if audio is None or len(audio) == 0:
                     continue
                 nat_samples += len(audio)
@@ -143,8 +148,13 @@ def tts(req: TTSRequest):
                 "audio_s": round(nat_audio_s, 2),
             }
         finally:
-            # Watchdog may have already force-released it; guard the release.
-            _lock_held_since = None
+            # Stop the underlying model generator (frees its frame loop) and
+            # release the lock immediately — even on barge-in or client drop.
+            if gen is not None:
+                try:
+                    gen.close()
+                except Exception:
+                    pass
             try:
                 _gpu_lock.release()
             except RuntimeError:
@@ -187,10 +197,9 @@ if __name__ == "__main__":
     ):
         pass
 
-    # Warm librosa/numba JIT now so the first time-stretch doesn't compile (10-30s)
-    # mid-request and trip the watchdog.
+    # Warm librosa/numba JIT now so the first time-stretch doesn't compile
+    # (10-30s) mid-request and stall the first real reply.
     _stretch(np.zeros(24000, dtype=np.float32), 1.15)
 
-    threading.Thread(target=_lock_watchdog, daemon=True).start()
     print(f"READY — streaming TTS on :{args.port} (sr={SR})", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")

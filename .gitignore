@@ -18,4 +18,5 @@ __pycache__/
 # Company take-home assignment — do NOT publish
 takehome_project.docx.md
 
-graphify-out
+# Local knowledge-graph output
+graphify-out/
