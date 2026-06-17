@@ -80,19 +80,26 @@ def main():
     ap.add_argument("--chunk-size", type=int, default=4)
     ap.add_argument("--runs", type=int, default=7)
     ap.add_argument("--lengths", default="short,medium,long")
-    ap.add_argument("--engine", default="cudagraph", choices=["cudagraph", "megakernel"])
+    ap.add_argument("--engine", default="cudagraph", choices=["cudagraph", "megakernel"],
+                    help="talker backbone engine")
+    ap.add_argument("--predictor", default="cudagraph", choices=["cudagraph", "megakernel"],
+                    help="code-predictor engine")
     args = ap.parse_args()
 
-    print(f"Loading {args.model} (engine={args.engine}) ...", flush=True)
+    print(f"Loading {args.model} (talker={args.engine}, predictor={args.predictor}) ...", flush=True)
     model = FasterQwen3TTS.from_pretrained(args.model)
 
+    import sys
+    sys.path.insert(0, "/workspace")
     if args.engine == "megakernel":
-        import sys
-        sys.path.insert(0, "/workspace")
         from megakernel_talker import MegakernelTalkerGraph
         base = model.talker_graph.model
         model.talker_graph = MegakernelTalkerGraph(base, base.config)
         print("Swapped talker to MEGAKERNEL", flush=True)
+    if args.predictor == "megakernel":
+        from megakernel_predictor import MegakernelPredictorGraph
+        model.predictor_graph = MegakernelPredictorGraph(model.predictor_graph)
+        print("Swapped predictor to MEGAKERNEL", flush=True)
 
     print("Warmup (capture CUDA graphs, 2 runs)...", flush=True)
     for _ in range(2):

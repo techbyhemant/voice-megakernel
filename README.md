@@ -1,31 +1,40 @@
 # Voice Megakernel — RTX 5090 Decode Megakernel → Qwen3-TTS on Pipecat
 
 Run [AlpinDale's `qwen_megakernel`](https://github.com/AlpinDale/qwen_megakernel)
-(a hand-written CUDA megakernel for Qwen3-0.6B) as the **talker decode backend**
-for **Qwen3-TTS**, streaming real-time speech into a **Pipecat** voice agent.
+(a hand-written CUDA megakernel for Qwen3-0.6B) as the decode backend for
+**Qwen3-TTS**, streaming real-time speech into a **Pipecat** voice agent.
 
 The voice loop runs **mic → Whisper (STT) → local LLM → Qwen3-TTS → speaker**.
-Only the TTS is custom: its talker (the 28-layer autoregressive backbone) is
-driven by the megakernel; the rest of Qwen3-TTS (code predictor + codec) stays
-in PyTorch.
+Only the TTS is custom: **both** of its autoregressive stages — the talker
+(28-layer backbone) *and* the code predictor (5-layer, 15-step inner loop) — are
+driven by the same megakernel; only the codec (tokens → waveform) stays in
+PyTorch. Driving the predictor on the kernel too is the project's biggest win and
+the task's stated bonus ("improve the megakernel's performance during integration").
 
 ## Headline results
 
 Qwen3-TTS `12Hz-0.6B-CustomVoice`, streaming, single RTX 5090, `chunk_size=4`,
 `ryan` voice. RTF = compute / audio (lower is better; 1.0 = real-time).
 
-| Talker engine | ms/step | RTF | TTFC |
+| Engine | ms/step | RTF | TTFC |
 |---|---|---|---|
 | Naive eager PyTorch (baseline) | — | **1.48** | n/a (buffered) |
 | CUDA-graph (faster-qwen3-tts) | 21.05 | 0.253 | 107 ms |
-| **Megakernel (this project)** | **15.07** | **0.181** | **83.7 ms** |
+| Megakernel talker only | 15.07 | 0.181 | 83.7 ms |
+| **Megakernel talker + predictor (this project)** | **9.51** | **0.114** | **63 ms** |
 
-- The megakernel is **~28% faster per step / on RTF** and **22% lower TTFC**
-  than an already-CUDA-graph-optimized talker — and **beats the < 90 ms TTFC
-  target** box-local.
+- The full megakernel (talker + predictor) is **~55% faster on RTF / per step**
+  and **41% lower TTFC** than the CUDA-graph baseline.
+- **RTF 0.114 beats the `< 0.15` target**; at `chunk_size=2`, **TTFC 52.8 ms beats
+  the `< 60` target**. (See the chunk-size sweep below; one non-kernel lever — the
+  glue — reaches the strict `< 0.1`.)
+- **Two kernel contributions:** the talker is 28% faster than the CUDA-graph
+  talker; adding the predictor on the same kernel wins a **further 37% per step**
+  (predictor stage: 8.55 → 4.03 ms/frame, **2.1×**).
 - Unmodified megakernel decode (Qwen3-0.6B chat, sanity check): **1050 tok/s**.
-- Talker output matches the PyTorch talker at **cosine 0.9997** (single- and
-  multi-step, see `megakernel_talker.py`).
+- Both stages match PyTorch closely: talker **cosine 0.9997**, predictor
+  **teacher-forced cosine 0.9993** (min) / 0.9998 (mean). See `megakernel_talker.py`
+  and `megakernel_predictor.py`.
 
 ## Why this matters (freight voice negotiation)
 
@@ -35,10 +44,10 @@ hundred milliseconds, or the bot feels robotic, kills rapport, and loses the
 negotiation. So **time-to-first-audio (TTFC) is the metric that maps to call
 quality** — not raw throughput.
 
-That's why this kernel work matters here: it cuts TTFC from 107 ms to **83.7 ms**,
-under the ~90 ms bar where turn-taking feels natural. The codec and code-predictor
-were already fast (CUDA graphs); the **talker backbone was the remaining lever**,
-and the megakernel is the fastest way to pull it.
+That's why this kernel work matters here: it cuts TTFC from 107 ms to **63 ms**
+(and to **52.8 ms** at `chunk_size=2`), well under the bar where turn-taking feels
+natural — and cuts RTF from 0.253 to **0.114**, so the GPU spends far less of each
+second of audio on compute (more headroom for concurrent calls).
 
 Product judgment also shaped what we *didn't* build: **no GUI** (the interface is
 the voice), and STT/LLM are **swappable off-the-shelf parts** — the engineering
@@ -47,19 +56,27 @@ latency.
 
 ## Where the time goes (bottleneck analysis)
 
-Profiling the naive PyTorch path (per decode step) showed the surprising split:
+Measured per-frame split (megakernel talker only, before the predictor work),
+profiled live with CUDA-synced timers on the deployed engine:
 
-| Component | Share of decode time |
-|---|---|
-| Codec (tokens → waveform) | **0.3%** (free) |
-| **Talker backbone (28L)** — *megakernel target* | 22% |
-| **Code predictor (5L, 15-step inner loop/frame)** | **78%** |
+| Component | per frame | share |
+|---|---|---|
+| Talker backbone (28L, megakernel) | 0.97 ms | 6.7% |
+| **Code predictor (5L, 15-step loop, CUDA graph)** | **8.6 ms** | **59%** |
+| Rest (codec embeds, talker head, sampling, glue) | ~5 ms | 34% |
 
-Key insight: the megakernel only accelerates the **backbone (22%)**. Hitting
-real-time requires the **code predictor** to also be fast — which CUDA graphs
-(from faster-qwen3-tts) provide. The megakernel then replaces the CUDA-graph
-backbone and wins a further 28%. So the win is: **CUDA-graph the predictor +
-megakernel the talker.**
+Key insight: once the megakernel solves the talker (~1 ms), the **code predictor
+becomes the bottleneck (59%)**, not the backbone. The predictor's per-layer
+architecture is *identical* to Qwen3-0.6B (hidden 1024, 16/8 heads, head_dim 128,
+intermediate 3072, rope 1e6) — only the layer count differs (5 vs 28). The
+megakernel takes layer-count as a *runtime* argument, so the **same compiled
+kernel** drives the predictor backbone (`num_layers=5`). Even run eagerly (16
+backbone calls + per-codebook heads/sampling/feedback in PyTorch), it beats the
+fused CUDA-graph predictor **2.1×** (8.55 → 4.03 ms/frame) — because the
+megakernel's per-step backbone is ~7× faster than the CUDA-graph one, which
+swamps the eager-loop overhead. So the win is: **megakernel BOTH autoregressive
+stages.** After that, the remaining ~4.5 ms/frame "rest" (a 15-way embedding loop
++ glue, all eager PyTorch) is what stands between RTF 0.114 and the strict `< 0.1`.
 
 ## Architecture
 
@@ -70,8 +87,8 @@ megakernel the talker.**
 │           │ text            │ ──► │        │  negotiation reply                │
 │           ▼                 │ ◄── │        ▼                                   │
 │    RemoteQwenTTS ───────────────► │  Qwen3-TTS streaming:                      │
-│ speaker ◄── audio chunks ◄────────│   talker step ─► MEGAKERNEL                │
-└────────────────────────────┘ PCM │   code predictor (CUDA graph) · codec      │
+│ speaker ◄── audio chunks ◄────────│   talker step    ─► MEGAKERNEL             │
+└────────────────────────────┘ PCM │   code predictor ─► MEGAKERNEL · codec=PT  │
    SSH tunnel: 8000 (TTS),          └──────────────────────────────────────────┘
                11435→11434 (LLM)
 ```
@@ -81,8 +98,8 @@ megakernel the talker.**
 - **All compute runs on the 5090** — the LLM (Ollama) *and* the TTS — reached
   over an SSH tunnel. This is the brief's Step 2 (inference server) + Step 3
   (Pipecat integration).
-- Inside the TTS: the **talker's per-step decode is the megakernel**; the **code
-  predictor** is a captured CUDA graph; the **codec** is PyTorch.
+- Inside the TTS: **both** the talker's per-step decode and the code predictor's
+  15-step loop run on the **megakernel**; only the **codec** stays in PyTorch.
 - The **LLM brain is swappable** — Ollama on the GPU by default (free, on the
   reimbursed GPU); set `ANTHROPIC_API_KEY` to use Claude instead (better
   negotiation quality, but billed to you — API cost isn't reimbursed).
@@ -103,6 +120,18 @@ identical to Qwen3-0.6B (28 layers, hidden 1024, 16 q / 8 kv heads, head_dim
    `rope_deltas = 0` holds for custom-voice/voice-clone so RoPE position = cache
    position with no offset.
 
+**Code predictor on the same kernel** (`megakernel_predictor.py`) — *no new CUDA*.
+The predictor backbone is the same architecture as the talker/0.6B but 5 layers
+instead of 28. Since the kernel's `decode_from_hidden` op takes `num_layers` as a
+**runtime argument** (only the Python-side weight pack and KV cache are sized per
+model), the same compiled kernel runs the predictor backbone by packing 5 layers
+of predictor weights and calling with `num_layers=5`. `MegakernelPredictorGraph`
+is a drop-in for faster-qwen3-tts's `PredictorGraph` (same `run(pred_input)→[15]`
+interface): it runs the 15-step inner loop eagerly — backbone on the kernel,
+per-codebook `lm_head` + top-k/p sampling + codec-embedding feedback in PyTorch.
+This was the surprise: even with eager per-step glue it beats the fused CUDA-graph
+predictor 2.1×, so no persistent/fused predictor kernel was needed.
+
 KV-cache prefill is copied from the PyTorch prefill into the kernel's cache
 (`TalkerKernel.prefill_from_cache`); convention verified by the multi-step check.
 
@@ -112,9 +141,10 @@ KV-cache prefill is copied from the PyTorch prefill into the kernel's cache
 bot.py                 Pipecat voice agent (Mac client)
 remote_tts_service.py  Pipecat TTS client → streams from the 5090 server
 run.sh                 launch the agent
-server/tts_server.py   streaming TTS server (5090); --engine cudagraph|megakernel
+server/tts_server.py   streaming TTS server (5090); --engine + --predictor cudagraph|megakernel
 megakernel_talker.py   TalkerKernel + MegakernelTalkerGraph + correctness/e2e checks
-benchmarks/bench_tts.py  TTFC/RTF/ms-step harness; --engine cudagraph|megakernel
+megakernel_predictor.py  MegakernelPredictorGraph (predictor 15-step loop on the kernel)
+benchmarks/bench_tts.py  TTFC/RTF/ms-step harness; --engine + --predictor cudagraph|megakernel
 patches/               kernel modification patch + notes
 .env.example           HF_TOKEN (server) — copy to .env
 ```
@@ -143,8 +173,9 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama serve &                       # run in tmux/background
 ollama pull qwen2.5:7b-instruct
 
-# 5. Streaming TTS server (megakernel = the 28%-faster talker; cudagraph = fallback)
-python server/tts_server.py --port 8000 --engine megakernel
+# 5. Streaming TTS server. Both stages on the megakernel (default); pass
+#    --engine/--predictor cudagraph to fall back per stage.
+python server/tts_server.py --port 8000 --engine megakernel --predictor megakernel
 ```
 
 ### Client (Mac, Apple Silicon)
@@ -167,13 +198,14 @@ Talk, pause, and the agent replies in the Qwen3-TTS voice.
 ## Benchmarking
 
 ```bash
-# on the 5090 (exclusive GPU — stop the server first)
-python benchmarks/bench_tts.py --engine cudagraph --runs 7
-python benchmarks/bench_tts.py --engine megakernel --runs 7
+# on the 5090 (exclusive GPU — stop the server first; the megakernel needs all SMs)
+python benchmarks/bench_tts.py --engine cudagraph  --predictor cudagraph  --runs 7  # baseline
+python benchmarks/bench_tts.py --engine megakernel --predictor cudagraph  --runs 7  # talker only
+python benchmarks/bench_tts.py --engine megakernel --predictor megakernel --runs 7  # both (headline)
 ```
 Multi-run, CUDA-synced, reports median/p90/min/max for TTFC, RTF, ms/step across
-short/medium/long texts. The `chunk_size` knob trades TTFC vs RTF (chunk 4:
-TTFC 107 ms / RTF 0.25; chunk 12: TTFC 232 ms / RTF 0.22 on the CUDA-graph path).
+short/medium/long texts. `--engine` selects the talker engine, `--predictor` the
+code-predictor engine, so each kernel's contribution is measurable in isolation.
 
 ## Observability
 
@@ -183,8 +215,8 @@ instrument the signals that map to call quality:
 - **Live per-turn metrics, split by layer:** every reply prints **compute(GPU)**
   TTFC/RTF (measured server-side, no network — `tts_server.py /metrics`) *and*
   **end-to-end** TTFC/RTF incl. network (`remote_tts_service.py`). Seeing both
-  side by side attributes latency to the right layer (measured demo run,
-  `chunk_size=2`: **~67 ms compute vs ~590 ms end-to-end ⇒ ~520 ms is
+  side by side attributes latency to the right layer (measured demo run, both
+  megakernels, `chunk_size=2`: **~55 ms compute vs ~590 ms end-to-end ⇒ ~535 ms is
   network/geography over the SSH tunnel, not the model**).
 - **What you'd monitor in production:**
   - **TTFC p50/p99** — the turn-taking latency a caller feels (alert if p99 climbs).
@@ -196,45 +228,50 @@ instrument the signals that map to call quality:
   live metrics apply online.
 
 Note: live end-to-end TTFC includes network round-trip (hundreds of ms over the
-SSH tunnel); the **on-GPU compute figure** (84 ms at `chunk_size=4`, ~67 ms at the
-`chunk_size=2` demo default) is what a co-located deployment would see.
+SSH tunnel); the **on-GPU compute figure** (63 ms at `chunk_size=4`, ~53 ms at the
+`chunk_size=2` demo default, both megakernels) is what a co-located deployment
+would see.
 
 ## What works, what's rough (honest)
 
-**Works:** end-to-end real-time voice agent; megakernel verifiably drives the
-talker (cosine 0.9997) and is 28% faster than the CUDA-graph talker; streaming
-is true frame-by-frame (not buffered); reproducible kernel patch.
+**Works:** end-to-end real-time voice agent; the megakernel verifiably drives
+**both** the talker (cosine 0.9997) and the code predictor (teacher-forced cosine
+0.9993) — together 55% faster than the CUDA-graph baseline (RTF 0.255 → 0.114);
+streaming is true frame-by-frame (not buffered); reproducible kernel patch + a
+no-recompile predictor reuse.
 
 **Rough / known issues:**
 - **Megakernel startup contention:** the megakernel launches 128 *persistent
   grid-synced* blocks that must all be co-resident on the SMs at once. If another
   process is actively using the GPU *at launch* (e.g. Ollama loading weights, or
   a server restart mid-flight), the blocks can't all schedule and the grid-sync
-  spins (GPU pegged, no progress). Starting it on a settled GPU resolves it — the
-  **live server now runs `--engine megakernel`** reliably (verified across the
-  streaming server + repeated requests at ~84 ms TTFC). `--engine cudagraph`
-  remains available as a fallback. A more robust fix would lower
-  `LDG_NUM_BLOCKS` so the kernel co-resides even under contention.
-- **TTFC over the network:** box-local TTFC is 84–107 ms, but end-to-end over the
-  SSH tunnel is ~700 ms — dominated by network round-trip + per-request HTTP
+  spins (GPU pegged, no progress). The dual-megakernel warmup launches the kernel
+  many more times, so it hits this more often — in practice **one server restart**
+  lands it on a settled GPU and it then runs reliably (verified live across the
+  streaming server + repeated requests). Benchmarks need the GPU **exclusive**
+  (stop the server first). `--engine/--predictor cudagraph` remain available as
+  per-stage fallbacks. The robust fix is to lower `LDG_NUM_BLOCKS` so the kernel
+  co-resides even under contention.
+- **TTFC over the network:** box-local TTFC is 53–63 ms, but end-to-end over the
+  SSH tunnel is ~590 ms — dominated by network round-trip + per-request HTTP
   setup, not compute. A persistent connection / co-locating the client would
   remove most of it. Reported separately from the on-GPU numbers.
-- **TTFC vs target:** 83.7 ms (megakernel, box-local, `chunk_size=4`) is under the
-  90 ms goal. `chunk_size` is the dominant TTFC lever — fewer frames before the
-  first emit lowers TTFC at some RTF cost. Measured on the live megakernel server:
+- **vs targets:** with both megakernels, `chunk_size` trades TTFC vs RTF. Measured
+  (CUDA-synced, both megakernels):
 
   | `chunk_size` | TTFC | RTF | audio/chunk |
   |---|---|---|---|
-  | 4 | 84 ms | 0.18 | 333 ms |
-  | **2** (demo default) | **64 ms** | 0.24 | 167 ms |
-  | 1 | 55 ms | 0.34 | 83 ms |
+  | 4 | 63 ms | **0.114** | 333 ms |
+  | **2** (demo default) | **52.8 ms** | 0.162 | 167 ms |
 
-  The demo runs `chunk_size=2` (64 ms, RTF 0.24 — well under the 1.0 real-time
-  ceiling). Below ~55 ms, chunk_size stops helping: you can't emit before one
-  frame + codec, and the remaining per-frame cost is the **code predictor (78%),
-  not the talker (22%)** — so the next lever would be megakernel-ing the predictor,
-  not the backbone. (Headline table above stays at `chunk_size=4` for an
-  apples-to-apples talker-engine comparison.)
+  At `chunk_size=4` **RTF 0.114 beats the `< 0.15` target**; at `chunk_size=2`
+  **TTFC 52.8 ms beats the `< 60` target**. The brief's strictest numbers
+  (TTFC `< 50` *and* RTF `< 0.1` jointly) remain just out of reach, and honestly
+  so: per-frame is now 9.51 ms = talker 0.97 + predictor 4.03 + **~4.5 ms eager
+  "rest"** (a 15-way codec-embedding loop + talker head + sampling, all uncaptured
+  PyTorch in faster-qwen3-tts's streaming loop). Vectorizing that glue (not kernel
+  work) is the last lever to RTF `< 0.1` — documented but not done, since it's
+  upstream-library surgery with correctness risk and little kernel relevance.
 
 ## Credits
 
