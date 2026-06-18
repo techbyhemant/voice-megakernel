@@ -6,10 +6,12 @@ locally, it POSTs text to the streaming TTS server on the 5090 (reached over an
 SSH tunnel) and yields audio frames as the PCM streams back — true frame-by-frame
 streaming into the Pipecat pipeline.
 
-Tunnel (run in a separate terminal, keep open):
-    ssh -i ~/.ssh/vast_ai -p <PORT> -L 8000:localhost:8000 root@ssh5.vast.ai
+Tunnel (run in a separate terminal, keep open). The server listens on 8000 on
+the box; we map it to LOCAL 8009 to avoid clashing with other local services on
+8000:
+    ssh -i ~/.ssh/vast_ai -p <PORT> -L 8009:localhost:8000 root@<host>
 
-Then the server is reachable at http://localhost:8000 from this machine.
+Then the server is reachable at http://localhost:8009 from this machine.
 """
 
 import time
@@ -26,6 +28,8 @@ from pipecat.frames.frames import (
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 
+from debug_taps import DIM  # shared color helper for the clean metrics line
+
 SAMPLE_RATE = 24000  # server streams 16-bit LE PCM @ 24 kHz mono
 NUM_CHANNELS = 1
 
@@ -35,10 +39,10 @@ class RemoteQwenTTSService(TTSService):
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8000",
+        base_url: str = "http://localhost:8009",  # local tunnel port (box serves on 8000); 8009 avoids local 8000 clashes
         speaker: str = "uncle_fu",
         language: str = "English",
-        chunk_size: int = 2,  # 2 frames/chunk: balanced point — TTFC ~53-59 ms, RTF ~0.18 (cs1=lower TTFC/higher RTF; cs≥6=RTF<0.1)
+        chunk_size: int = 2,  # 2 frames/chunk: on-GPU TTFC ~45 ms, RTF ~0.09 (both megakernels + codec graph); smaller cs = lower TTFC, higher RTF
         **kwargs,
     ):
         super().__init__(
@@ -103,9 +107,10 @@ class RemoteQwenTTSService(TTSService):
             except Exception:
                 pass
         print(
-            f"📊 [TTS] compute(GPU): TTFC={gen.get('gen_ttfc_ms', 'n/a')}ms RTF={gen.get('gen_rtf', 'n/a')}  |  "
-            f"end-to-end(+net): TTFC={ttfc_ms:.0f}ms RTF={rtf:.2f}  audio={audio_s:.2f}s  "
-            f"«{text[:40]}»",
+            DIM(
+                f"   🔊 speech: GPU ttfc {gen.get('gen_ttfc_ms', 'n/a')} ms · rtf {gen.get('gen_rtf', 'n/a')}"
+                f"    heard: ttfc {ttfc_ms:.0f} ms · rtf {rtf:.2f} · {audio_s:.1f}s audio"
+            ),
             flush=True,
         )
         yield TTSStoppedFrame()

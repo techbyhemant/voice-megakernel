@@ -5,14 +5,15 @@ This is the brief's "Step 2: inference server — prompt in -> stream out".
 It loads faster-qwen3-tts (CUDA-graph optimized Qwen3-TTS), captures the CUDA
 graphs once at startup, then exposes a single streaming endpoint:
 
-    POST /tts   {"text": "...", "speaker": "ryan", "chunk_size": 4}
+    POST /tts   {"text": "...", "speaker": "uncle_fu", "chunk_size": 2}
        -> streams raw 16-bit little-endian PCM @ 24 kHz mono, chunk-by-chunk,
           as each audio chunk is decoded (NOT buffered).
 
 The Pipecat client on the Mac connects to this over an SSH tunnel.
 
-Later, the megakernel swaps into faster-qwen3-tts's talker decode step
-(talker_graph._decode_step) — this server doesn't change when that happens.
+The talker and code-predictor decode run on the megakernel by default (select per
+stage with --engine/--predictor cudagraph|megakernel); only the codec stays in
+PyTorch (CUDA-graphed). See megakernel_talker.py / megakernel_predictor.py.
 
 Run:  /venv/main/bin/python tts_server.py --port 8000
 """
@@ -47,6 +48,38 @@ class TTSRequest(BaseModel):
     temperature: float = 0.3  # talker sampling: lower = more consistent pace/energy, fewer whisper/slow takes (0.9 default)
     top_k: int = 20           # tighter sampling -> less prosody drift between utterances
     speed: float = 1.15   # pitch-preserving playback speed (1.0 = natural); model has no rate knob
+    # Runaway backstop. The talker intermittently fails to emit EOS (Qwen3-TTS
+    # issue #118 — happens on stock PyTorch too, ~0.5%; the megakernel amplifies
+    # it) and runs to the KV ceiling (~2046 frames ≈ 162s) instead of stopping.
+    # 0 = AUTO: size the cap to THIS reply's text (see _dynamic_cap) so a short
+    # reply gets a tight cap (a runaway is cut in ~5-6s, not 24s) while long text
+    # is never clipped. A positive value forces an explicit fixed cap instead.
+    # The multiple-EOS streaming patch is the primary fix; this is the catch-all.
+    max_new_tokens: int = 0
+
+
+# Frame rate of the 12 Hz codec, measured: 2020 frames -> 161.76 s.
+FRAMES_PER_SEC = 12.5
+_MAX_FRAMES = 2046  # talker KV ceiling (MAX_SEQ_LEN - 2); the loop can't exceed it
+
+
+def _dynamic_cap(text: str) -> int:
+    """Size the talker frame budget to the reply text so a runaway is bounded to
+    a few seconds beyond the longest plausible delivery of THIS text — without
+    ever clipping a genuine reply.
+
+    Expected delivery ≈ max(5 frames/word, 0.85 frames/char) (≈150 wpm / ~15
+    chars-per-second at 12.5 fps). We allow 3× that plus a 50-frame margin, with a
+    ~5 s floor. 3× ≈ a 50 wpm floor on speech rate — slower than any natural
+    speech — so a real reply never hits it, but a 2-word runaway ("Safe trip!")
+    is cut at ~6 s instead of 24 s.
+    """
+    t = (text or "").strip()
+    n_words = len(t.split())
+    n_chars = len(t)
+    est_frames = max(n_words * 5, int(n_chars * 0.85))
+    cap = est_frames * 3 + 50
+    return max(60, min(_MAX_FRAMES, cap))
 
 
 def _to_pcm16(audio) -> bytes:
@@ -71,17 +104,10 @@ def _stretch(audio, speed: float):
 class _GraphedCodecDecoder:
     """Per-input-shape CUDA-graph cache around the codec decoder's forward.
 
-    The codec decode is launch-overhead-bound: eager mode dispatches hundreds of tiny
-    kernels per call (~16 ms), while the actual compute is ~3 ms. A CUDA graph records
-    that launch sequence once per distinct input shape and replays it as a single launch
-    — same kernels, same weights, identical output (lossless). The codec runs once per
-    streamed chunk, so this fixed per-call cost is the dominant RTF term at small
-    chunk_size; removing it lowers RTF at every operating point.
-
-    Shapes vary (phase-1 windows grow; phase-2 is a fixed context+chunk window), so we
-    cache one graph per frame-count. Capture is near-instant, so this adds no meaningful
-    startup cost (unlike torch.compile). Drop-in for decoder.forward; chunked_decode's
-    internal self(codes_chunk) routes through it.
+    The codec is launch-overhead-bound (~16 ms eager / ~3 ms graphed, lossless) and
+    runs once per streamed chunk, so it's the dominant RTF term at small chunk_size.
+    Input shapes vary, so we cache one graph per frame-count (capture is near-instant).
+    Drop-in for decoder.forward.
     """
 
     def __init__(self, orig_forward):
@@ -128,17 +154,11 @@ _SENTINEL = object()  # distinct from a yielded (None, ...) chunk
 
 @app.post("/tts")
 async def tts(req: TTSRequest, request: Request):
-    """Stream TTS with INTERACTIVE barge-in support.
-
-    Earlier this was a sync generator. On a client disconnect (barge-in),
-    Starlette runs sync generators in a threadpool and does NOT reliably throw
-    GeneratorExit into them — so it parked at `yield` holding the GPU lock, and
-    the next turn blocked 30 s on acquire(). That made interruptions unusable.
-
-    Now it's async: we drive the blocking model generator one chunk at a time in
-    the threadpool and check `request.is_disconnected()` between chunks. On
-    barge-in we stop within ~one chunk (~150 ms), close the generator, and
-    release the lock IMMEDIATELY in `finally` — so the next turn never waits.
+    """Stream TTS with barge-in support: drive the blocking model generator one
+    chunk at a time in the threadpool, check `request.is_disconnected()` between
+    chunks, and release the GPU lock in `finally` so a barge-in frees it within
+    ~one chunk (~150 ms) and the next turn never waits. (Async, not a sync
+    generator: Starlette won't reliably throw GeneratorExit into sync ones.)
     """
     loop = asyncio.get_running_loop()
 
@@ -151,6 +171,8 @@ async def tts(req: TTSRequest, request: Request):
         if not got:
             return
         gen = None
+        cap = req.max_new_tokens if req.max_new_tokens and req.max_new_tokens > 0 \
+            else _dynamic_cap(req.text)
         try:
             t0 = time.perf_counter()
             gen_ttfc_ms = None
@@ -163,6 +185,7 @@ async def tts(req: TTSRequest, request: Request):
                 chunk_size=req.chunk_size,
                 temperature=req.temperature,
                 top_k=req.top_k,
+                max_new_tokens=cap,   # dynamic runaway backstop sized to the text (see _dynamic_cap)
             )
             while True:
                 # Barge-in check BEFORE spending a chunk of GPU time.

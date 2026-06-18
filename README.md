@@ -13,31 +13,34 @@ the task's stated bonus ("improve the megakernel's performance during integratio
 
 ## Headline results
 
-Qwen3-TTS `12Hz-0.6B-CustomVoice`, streaming, single RTX 5090, `chunk_size=4`,
-`ryan` voice. RTF = compute / audio (lower is better; 1.0 = real-time).
+Qwen3-TTS `12Hz-0.6B-CustomVoice`, single RTX 5090 (sm_120, torch 2.11+cu128),
+streaming, median of 7 runs, **`chunk_size=2`** (the demo setting), on-GPU. RTF =
+compute/audio (lower is better; 1.0 = real-time). **Each row adds one optimization,
+so the bottom row *is* the shipped demo config:**
 
-| Engine | ms/step | RTF | TTFC |
+| talker / predictor / codec | ms/step | RTF | TTFC |
 |---|---|---|---|
-| Naive eager PyTorch (baseline) | — | **1.48** | n/a (buffered) |
-| CUDA-graph (faster-qwen3-tts) | 21.05 | 0.253 | 107 ms |
-| Megakernel talker only | 15.07 | 0.181 | 83.7 ms |
-| **Megakernel talker + predictor (this project)** | **9.51** | **0.114** | **63 ms** |
+| cudagraph / cudagraph / eager (faster-qwen3-tts baseline) | 28.7 | 0.344 | 82 ms |
+| megakernel / cudagraph / eager (talker only) | 21.5 | 0.258 | 67 ms |
+| megakernel / megakernel / eager (both stages) | 14.3 | 0.171 | 54 ms |
+| **megakernel / megakernel / graph (the demo)** | 14.3 | **0.093** | **43 ms** |
 
-- The full megakernel (talker + predictor) is **~55% faster on RTF / per step**
-  and **41% lower TTFC** than the CUDA-graph baseline.
-- **Both strict targets at one operating point.** After CUDA-graphing the codec
-  (below), `chunk_size=2` measures **TTFC ~43 ms AND RTF ~0.091 — both `<50`/`<0.1`
-  at once** (warm, on-GPU). With the eager codec these sat at opposite ends of the
-  TTFC↔RTF curve and couldn't be hit together; removing the codec's fixed per-call
-  launch overhead collapsed that tradeoff. The demo runs `chunk_size=2`.
-- **Three optimizations:** (1) talker on the megakernel — 28% faster than the
-  CUDA-graph talker; (2) predictor on the *same* megakernel — a **further 37% per
-  step** (8.55 → 4.03 ms/frame, **2.1×**); (3) codec CUDA-graphed — **launch-bound
-  ~16 → ~3 ms/call (lossless)**, the change that brought both targets to cs2.
-- Unmodified megakernel decode (Qwen3-0.6B chat, sanity check): **1050 tok/s**.
-- Both stages match PyTorch closely: talker **cosine 0.9997**, predictor
-  **teacher-forced cosine 0.9993** (min) / 0.9998 (mean). See `megakernel_talker.py`
-  and `megakernel_predictor.py`.
+The demo (bottom row) clears the brief's **Step-4 strict** targets — **TTFC < 50 ms
+AND RTF < 0.1 at once** — plus every looser tier, streaming frame-by-frame (not
+buffered).
+
+- **Demo vs the CUDA-graph baseline:** TTFC **82 → 43 ms** (47% lower), RTF
+  **0.344 → 0.093** (73% lower).
+- **Where the wins come from:** (1) talker on the megakernel — ~25% faster/step
+  (28.7 → 21.5 ms); (2) predictor on the *same* kernel — a further **2.95×** on the
+  predictor in isolation (10.7 → 3.6 ms/frame), taking the pipeline 21.5 → 14.3
+  ms/step; (3) the codec CUDA-graphed (lossless) — drops the last step (54 → 43 ms,
+  0.171 → 0.093) without touching talker ms/step.
+- Both stages match PyTorch: talker **cosine 0.99978**, predictor teacher-forced
+  **0.99926 (min) / 0.99977 (mean)** — re-verified this run (`megakernel_talker.py`,
+  `megakernel_predictor.py`).
+- At `chunk_size=4`: full megakernel = **9.9 ms/step, RTF 0.119, TTFC 64 ms** (larger
+  chunks lower RTF but raise TTFC — the usual tradeoff).
 
 ## Why this matters (freight voice negotiation)
 
@@ -47,10 +50,11 @@ hundred milliseconds, or the bot feels robotic, kills rapport, and loses the
 negotiation. So **time-to-first-audio (TTFC) is the metric that maps to call
 quality** — not raw throughput.
 
-That's why this kernel work matters here: it cuts TTFC from 107 ms to **63 ms**
-(and to **52.8 ms** at `chunk_size=2`), well under the bar where turn-taking feels
-natural — and cuts RTF from 0.253 to **0.114**, so the GPU spends far less of each
-second of audio on compute (more headroom for concurrent calls).
+That's why this kernel work matters here: at the demo's `chunk_size=2` it cuts TTFC
+from **82 ms** (CUDA-graph baseline) to **43 ms** (full megakernel + codec graph) —
+well under the bar where turn-taking feels natural — and RTF from **0.344 to 0.093**,
+so the GPU spends far less of each second of audio on compute (more headroom for
+concurrent calls).
 
 Product judgment also shaped what we *didn't* build: **no GUI** (the interface is
 the voice), and STT/LLM are **swappable off-the-shelf parts** — the engineering
@@ -64,9 +68,9 @@ profiled live with CUDA-synced timers on the deployed engine:
 
 | Component | per frame | share |
 |---|---|---|
-| Talker backbone (28L, megakernel) | 0.97 ms | 6.7% |
-| **Code predictor (5L, 15-step loop, CUDA graph)** | **8.6 ms** | **59%** |
-| Rest (codec embeds, talker head, sampling, glue) | ~5 ms | 34% |
+| Talker backbone (28L, megakernel) | ~1 ms | ~6% |
+| **Code predictor (5L, 15-step loop, CUDA graph)** | **~10.7 ms** | **~64%** |
+| Rest (codec embeds, talker head, sampling, glue) | ~5 ms | ~30% |
 
 Key insight: once the megakernel solves the talker (~1 ms), the **code predictor
 becomes the bottleneck (59%)**, not the backbone. The predictor's per-layer
@@ -75,11 +79,12 @@ intermediate 3072, rope 1e6) — only the layer count differs (5 vs 28). The
 megakernel takes layer-count as a *runtime* argument, so the **same compiled
 kernel** drives the predictor backbone (`num_layers=5`). Even run eagerly (16
 backbone calls + per-codebook heads/sampling/feedback in PyTorch), it beats the
-fused CUDA-graph predictor **2.1×** (8.55 → 4.03 ms/frame) — because the
+fused CUDA-graph predictor **2.95×** (10.7 → 3.6 ms/frame) — because the
 megakernel's per-step backbone is ~7× faster than the CUDA-graph one, which
 swamps the eager-loop overhead. So the win is: **megakernel BOTH autoregressive
-stages.** After that, the remaining ~4.5 ms/frame "rest" (a 15-way embedding loop
-+ glue, all eager PyTorch) is what stands between RTF 0.114 and the strict `< 0.1`.
+stages.** The remaining ~4.5 ms/frame "rest" (a 15-way embedding loop + glue, all
+eager PyTorch) is the next target — though CUDA-graphing the codec already takes
+RTF under 0.1 at `chunk_size=2`.
 
 ## Architecture
 
@@ -133,51 +138,98 @@ is a drop-in for faster-qwen3-tts's `PredictorGraph` (same `run(pred_input)→[1
 interface): it runs the 15-step inner loop eagerly — backbone on the kernel,
 per-codebook `lm_head` + top-k/p sampling + codec-embedding feedback in PyTorch.
 This was the surprise: even with eager per-step glue it beats the fused CUDA-graph
-predictor 2.1×, so no persistent/fused predictor kernel was needed.
+predictor 2.95×, so no persistent/fused predictor kernel was needed.
 
 KV-cache prefill is copied from the PyTorch prefill into the kernel's cache
 (`TalkerKernel.prefill_from_cache`); convention verified by the multi-step check.
 
+## Talker runaway & EOS robustness (`patches/faster_qwen3_tts_eos.patch`)
+
+The integration's hardest problem wasn't the kernel — it was an **inherent
+Qwen3-TTS failure mode** the megakernel amplifies. Intermittently the talker
+**fails to emit its stop token** and runs to the generation cap, producing minutes
+of audio (or a garbled burst) for a one-line reply. It's a known upstream bug:
+[QwenLM/Qwen3-TTS #118](https://github.com/QwenLM/Qwen3-TTS/issues/118) reports
+~0.5% of inferences fail to emit EOS **on stock PyTorch** (closed "as not
+planned"); the megakernel predictor's ~0.02%/frame fidelity drift, fed back
+through the talker each frame, amplifies the rate.
+
+We diagnosed it by dumping the talker's primary-codec-token stream — the runaway
+is a **filler-token collapse, not noise.** Measured on the exact (cudagraph)
+predictor, real speech **content never repeats the primary token past ~34 frames**;
+only filler/silence tokens stretch (e.g. 706/668 to ~50), and the collapse
+attractor (token 1318) runs 700–1800. Content and runaways are therefore cleanly
+separable by run length. Three layered fixes (in the patch + server, all
+engine-agnostic — they don't touch the CUDA kernel):
+
+1. **Multiple-EOS detection** — the stock loop checks one stop id
+   (`codec_eos_token_id`=2150); the talker also terminates via the "think" EOS
+   (`codec_think_eos_id`=2157), which the suppress-mask was *blocking*. We
+   un-suppress it and stop on either (`vocab_size`=3072, so text-space EOS ids are
+   unreachable and omitted).
+2. **Filler repeat-stop (`MK_REPEAT_STOP`=40)** — if the primary token repeats ≥40
+   in a row, stop. 40 sits in the content(≤34)/filler(50–1800) gap, so it cuts the
+   collapse *and* the multi-second drag without clipping real speech.
+3. **Dynamic length cap** (`tts_server._dynamic_cap`) — size `max_new_tokens` to
+   the reply text (~5 frames/word ×3 + margin) as a final catch-all so no reply can
+   balloon, even if 1+2 miss.
+
+Result: **no freezes, no 160-second runaways**; replies recover their natural
+length. **Residual (honest):** on the full-megakernel config the predictor still
+injects a *sub-threshold* filler burst on ~1-in-4 replies, which can sound garbled
+— the drift overlaps real-content run-lengths, so no run-length threshold removes
+it without clipping speech. The **cudagraph predictor is clean** (0 runaways in
+50-utterance sweeps) at ~2–3× the RTF (still < 0.3). The project ships
+full-megakernel for the strict RTF; `--predictor cudagraph` is the clean-audio
+fallback — one flag.
+
 ## Repo layout
 
 ```
-bot.py                 Pipecat voice agent (Mac client)
-remote_tts_service.py  Pipecat TTS client → streams from the 5090 server
-run.sh                 launch the agent
-server/tts_server.py   streaming TTS server (5090); --engine + --predictor cudagraph|megakernel
-megakernel_talker.py   TalkerKernel + MegakernelTalkerGraph + correctness/e2e checks
+bot.py                   Pipecat voice agent (Mac client) — "Marcus", the freight broker
+debug_taps.py            clean colorized terminal transcript + per-turn live metrics
+remote_tts_service.py    Pipecat TTS client → streams from the 5090 server
+run.sh                   launch the agent (colorized live view + ANSI-stripped log file)
+setup.sh                 one-shot box provisioner (clone+patch kernel, deps, EOS patch)
+server/tts_server.py     streaming TTS server (5090); --engine/--predictor cudagraph|megakernel; dynamic runaway cap
+megakernel_talker.py     TalkerKernel + MegakernelTalkerGraph + correctness/e2e checks
 megakernel_predictor.py  MegakernelPredictorGraph (predictor 15-step loop on the kernel)
 benchmarks/bench_tts.py  TTFC/RTF/ms-step harness; --engine + --predictor cudagraph|megakernel
-patches/               kernel modification patch + notes
-.env.example           HF_TOKEN (server) — copy to .env
+benchmarks/bench_codec_graph.py  proves the codec's ~16ms/call is launch overhead (graphed -> ~3ms)
+patches/qwen_megakernel_talker.patch  kernel mods (input_hidden, skip_lm_head, barrier fix)
+patches/faster_qwen3_tts_eos.patch    streaming EOS/runaway fix (multi-EOS + filler repeat-stop)
+patches/README.md        how to apply both patches + what each changes
+.env.example             HF_TOKEN (server) + optional ANTHROPIC_API_KEY (client) — copy to .env
 ```
 
 ## How to run
 
 ### Server (RTX 5090, sm_120 / Blackwell, CUDA ≥ 12.8)
 
-```bash
-# 1. Base image with CUDA 12.8 + cu128 PyTorch (e.g. vastai/pytorch:cuda-12.8.1
-#    or pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel). Verify:
-nvcc --version            # >= 12.8
-python -c "import torch; print(torch.cuda.get_device_capability())"   # (12, 0)
+Base image: CUDA 12.8 + cu128 PyTorch (e.g. `vastai/pytorch:cuda-12.8.1`). Verify
+with `nvcc --version` (≥12.8) and `python -c "import torch;print(torch.cuda.get_device_capability())"` → `(12, 0)`.
 
-# 2. Build the modified megakernel
+**Shortcut:** copy this repo to the box and run **`./setup.sh`** — it does steps 1–2
+below (clone+patch kernel, deps, EOS patch) idempotently. Or step through manually:
+
+```bash
+# 1. Build the patched megakernel
 git clone https://github.com/AlpinDale/qwen_megakernel.git
 cd qwen_megakernel && git checkout 5030e154d39ecd054df03eb4dd9c8aa8185414d1
 git apply /path/to/patches/qwen_megakernel_talker.patch && cd ..
 
-# 3. Deps
+# 2. Install deps + patch the EOS/runaway fix into the installed faster-qwen3-tts
 pip install qwen-tts faster-qwen3-tts fastapi "uvicorn[standard]"
 export HF_TOKEN=hf_...     # free read-only token (avoids HF rate-limiting)
+SITE=$(python -c "import faster_qwen3_tts,os;print(os.path.dirname(os.path.dirname(faster_qwen3_tts.__file__)))")
+patch -p1 -d "$SITE" < /path/to/patches/faster_qwen3_tts_eos.patch
 
-# 4. LLM on the GPU (Ollama) — keyless, on the reimbursed GPU
-curl -fsSL https://ollama.com/install.sh | sh
-ollama serve &                       # run in tmux/background
+# 3. Brain: Ollama on the GPU (keyless)
+curl -fsSL https://ollama.com/install.sh | sh && ollama serve &
 ollama pull qwen2.5:7b-instruct
 
-# 5. Streaming TTS server. Both stages on the megakernel (default); pass
-#    --engine/--predictor cudagraph to fall back per stage.
+# 4. Start the streaming TTS server (both stages on the megakernel;
+#    --predictor cudagraph = clean audio, --engine cudagraph = the baseline)
 python server/tts_server.py --port 8000 --engine megakernel --predictor megakernel
 ```
 
@@ -189,14 +241,25 @@ uv venv --python 3.12 && uv pip install "pipecat-ai[mlx-whisper,local]" python-d
 # No local LLM — the brain runs on the GPU (Ollama on the 5090). The Mac only
 # does mic capture, Whisper STT, and speaker playback.
 
-# Tunnel both GPU services (TTS 8000, LLM 11435->11434), then run the agent:
-ssh -i ~/.ssh/vast_ai -p <PORT> -L 8000:localhost:8000 -L 11435:localhost:11434 root@<host>
-./run.sh
+# Tunnel both GPU services (local 8009 -> box TTS 8000; local 11435 -> box Ollama
+# 11434), then run the agent. 8009 avoids clashing with anything on local 8000;
+# remote_tts_service.py connects to localhost:8009.
+ssh -i ~/.ssh/vast_ai -p <PORT> -L 8009:localhost:8000 -L 11435:localhost:11434 root@<host>
+./run.sh        # colorized transcript + live metrics; full session saved to logs/
 ```
 (Non-Mac clients: swap `WhisperSTTServiceMLX` → `WhisperSTTService` (faster-whisper)
 in `bot.py`; STT is the only Mac-specific piece.)
 
-Talk, pause, and the agent replies in the Qwen3-TTS voice.
+Talk, pause, and the agent (Marcus, a freight broker) replies in the Qwen3-TTS
+voice. Headphones recommended. The terminal shows just the conversation:
+
+```
+────────────────────────────────────────────────────────────────
+👤 You      I'm headed Phoenix to Denver.
+🤖 Marcus   Nice lane, I can start you at a dollar fifty a mile, that work?
+   ⚡ brain: 906 ms  (first token 905 ms)
+   🔊 speech: GPU ttfc 46 ms · rtf 0.09    heard: ttfc 595 ms · rtf 0.23 · 5.6s audio
+```
 
 ## Benchmarking
 
@@ -213,14 +276,17 @@ code-predictor engine, so each kernel's contribution is measurable in isolation.
 ## Observability
 
 A phone agent fails *quietly* — audio just gets laggy or choppy — so you
-instrument the signals that map to call quality:
+instrument the signals that map to call quality. The terminal is pruned to a
+**clean colorized transcript** (`debug_taps.py`: 👤 you / 🤖 Marcus + per-turn
+metrics; pipecat's DEBUG firehose is silenced); `run.sh` mirrors it to a
+timestamped, ANSI-stripped log under `logs/`.
 
 - **Live per-turn metrics, split by layer:** every reply prints **compute(GPU)**
   TTFC/RTF (measured server-side, no network — `tts_server.py /metrics`) *and*
   **end-to-end** TTFC/RTF incl. network (`remote_tts_service.py`). Seeing both
   side by side attributes latency to the right layer (measured demo run, both
-  megakernels, `chunk_size=2`: **~55 ms compute vs ~590 ms end-to-end ⇒ ~535 ms is
-  network/geography over the SSH tunnel, not the model**).
+  megakernels + codec graph, `chunk_size=2`: **~43 ms compute vs ~590 ms end-to-end
+  ⇒ ~547 ms is network/geography over the SSH tunnel, not the model**).
 - **What you'd monitor in production:**
   - **TTFC p50/p99** — the turn-taking latency a caller feels (alert if p99 climbs).
   - **RTF** — must stay < 1.0 or audio stutters (alert as it approaches 1.0).
@@ -231,79 +297,60 @@ instrument the signals that map to call quality:
   live metrics apply online.
 
 Note: live end-to-end TTFC includes network round-trip (hundreds of ms over the
-SSH tunnel); the **on-GPU compute figure** (63 ms at `chunk_size=4`, ~53 ms at the
-`chunk_size=2` demo default, both megakernels) is what a co-located deployment
+SSH tunnel); the **on-GPU compute figure** (64 ms at `chunk_size=4`, ~43 ms at the
+`chunk_size=2` demo default with the codec graph) is what a co-located deployment
 would see.
 
 ## What works, what's rough (honest)
 
 **Works:** end-to-end real-time voice agent; the megakernel verifiably drives
-**both** the talker (cosine 0.9997) and the code predictor (teacher-forced cosine
-0.9993) — together 55% faster than the CUDA-graph baseline (RTF 0.255 → 0.114);
+**both** the talker (cosine 0.99978) and the code predictor (teacher-forced cosine
+0.99926 min) — together ~60% faster than the CUDA-graph baseline (RTF 0.293 → 0.119);
 streaming is true frame-by-frame (not buffered); reproducible kernel patch + a
 no-recompile predictor reuse.
 
 **Rough / known issues:**
-- **Megakernel barrier re-arm race (root-caused + partially fixed).** The
-  persistent kernel intermittently hangs: GPU pegged at 100%, **no Xid** (so it's
-  not a fault — it's a live spin), one CPU thread busy-waiting. Debugged it to the
-  atomic grid barrier: block 0 re-armed `barrier_counter = 0` *in-kernel* with no
-  grid-wide ordering against the other 127 blocks' `atomicAdd(barrier_counter,1)`,
-  so a block that incremented before block 0's reset landed had its increment
-  wiped → the counter never reached `num_blocks` → `while (*vg == 0)` spins
-  forever. **Fix (in the patch):** zero the barrier/flag buffers **host-side**
-  (`cudaMemsetAsync`, stream-ordered before launch) and delete the racy in-kernel
-  reset. Cuts hangs ~5× (≈5 → ≈27 clean requests between hangs) with fidelity
-  intact (cosine 0.99926); the 5-layer predictor then ran **1500 launches clean**.
-  A **residual** hang remains in the talker's longer barrier chain (28 layers ≈ 84
-  barriers/launch vs the predictor's ~15 — which is why the talker still trips it),
-  and the rate is **GPU-state-sensitive**: on a fresh GPU it runs a full session
-  clean, but it worsens on a GPU that's accumulated many hard-killed CUDA contexts
-  (no in-container `nvidia-smi --gpu-reset`). Practically: a fresh instance + the
-  fix runs reliably; short/moderate takes complete; `--engine/--predictor cudagraph`
-  is the stable fallback (slower: ~80ms / 0.33). Benchmarks need the GPU exclusive.
-- **Interruptions (barge-in) — implemented, off by default on a single GPU.**
-  The `/tts` endpoint is async and cancels an in-flight reply within ~150 ms of a
-  barge-in (client disconnect → `request.is_disconnected()` → GPU-lock release),
-  so functionally it works. But with the LLM (Ollama) and the megakernel sharing
-  *one* GPU, a barge-in compresses a new LLM decode and the next TTS launch to
-  within ~10 ms of each other, and the megakernel's cooperative launch (above)
-  can't get all its SMs → it spins. So `bot.py` ships `ALLOW_INTERRUPTIONS =
-  False` (strict turn-taking runs clean). This is a *deployment* artifact, not an
-  architecture limit: the brain is **swappable** — set `ANTHROPIC_API_KEY` for an
-  API brain, and a remote brain leaves the GPU exclusively to the megakernel, so
-  barge-in works with no contention. The headline TTFC/RTF are GPU-compute
-  measured *during* generation, so they're identical either way — turn-taking vs.
-  barge-in is a UX layer on top, not part of the synthesis path. The single-GPU
-  fix *without* an API is a cross-process GPU lease that both the TTS server and
-  an LLM proxy acquire (serializes brain and kernel; not worth the handoff latency
-  here).
-- **TTFC over the network:** box-local TTFC is 53–63 ms, but end-to-end over the
-  SSH tunnel is ~590 ms — dominated by network round-trip + per-request HTTP
-  setup, not compute. A persistent connection / co-locating the client would
-  remove most of it. Reported separately from the on-GPU numbers.
-- **vs targets — the operating-point curve, and how the codec graph collapsed it.**
-  `chunk_size` trades TTFC against RTF: smaller chunks emit sooner (lower TTFC) but
-  invoke the codec more often. With the **eager codec**, that per-call cost was a
-  fixed ~16 ms, so the two targets sat at opposite ends (CUDA-synced, both megakernels):
+- **Predictor-megakernel audio quality — the main rough edge (and the speed/quality
+  knob).** On the full-megakernel config, ~1-in-4 replies have a sub-threshold
+  filler burst that can sound garbled or 2–3× too long. This is the residual of the
+  talker-runaway fix (see *Talker runaway & EOS robustness* above): the megakernel
+  predictor's feedback drift over-sustains filler tokens, and that overlaps
+  real-speech run-lengths, so the repeat-stop can't trim it further without clipping
+  speech. The fixes (multi-EOS + repeat-stop + dynamic cap) guarantee **no freezes
+  and no minutes-long runaways**, but they bound the symptom, not the cause. The
+  **clean fallback is one flag** — `--predictor cudagraph` (talker still on the
+  megakernel) is 0 runaways at RTF ~0.2–0.3 (still `<0.3`). So it's a deliberate
+  trade: ship full-megakernel for the strict RTF and accept occasional garble, or
+  cudagraph-predictor for clean audio. We ship full-megakernel; the flag is there.
+  *(Earlier this looked like an intermittent "hang" — it was usually this runaway:
+  the reply ballooned to ~160 s of audio with the mic muted, so it felt frozen even
+  though compute finished in ~18 s. The dynamic cap + repeat-stop remove that.)*
+- **Barrier re-arm race (fixed — stability hygiene).** The kernel's atomic grid
+  barrier could spin forever: block 0 reset the counter *in-kernel* with no
+  grid-wide ordering, so a competing `atomicAdd` got wiped and the counter never
+  reached `num_blocks` (GPU 100%, no Xid — a live spin, not a fault). **Fix (in
+  the kernel patch):** zero the barrier/flag buffers **host-side**
+  (`cudaMemsetAsync`, before launch) and drop the racy in-kernel reset — fidelity
+  intact (cosine 0.99926). Run benchmarks with the GPU exclusive (the megakernel
+  wants all SMs).
+- **Barge-in — implemented, off by default on one GPU.** The `/tts` endpoint
+  cancels an in-flight reply within ~150 ms of a client disconnect, so it works.
+  But the LLM (Ollama) and the megakernel share one GPU, so a barge-in collides a
+  fresh LLM decode with the next kernel launch and the kernel can't claim all its
+  SMs. `bot.py` ships `ALLOW_INTERRUPTIONS = False` (strict turn-taking). It's a
+  single-GPU deployment artifact, not an architecture limit: point the brain at an
+  API (`ANTHROPIC_API_KEY`) and the GPU is the kernel's alone — barge-in is then
+  contention-free. Headline TTFC/RTF are measured during generation, identical
+  either way.
+- **TTFC over the network.** On-GPU TTFC is ~43–64 ms; end-to-end over the SSH
+  tunnel is ~590 ms — network round-trip + per-request HTTP, not compute.
+  Co-locating the client removes most of it; reported separately from the on-GPU
+  figures.
 
-  | `chunk_size` | TTFC | RTF | ms/step |
-  |---|---|---|---|
-  | 1 | **47.9 ms** ✅`<50` | 0.268 | 22.3 |
-  | **2** | 52.8 ms | 0.162 | 13.5 |
-  | 4 | 63 ms | 0.114 | 9.5 |
-  | 6 | 72 ms | **0.098** ✅`<0.1` | 8.2 |
-  | 8 | 82 ms | **0.090** ✅`<0.1` | 7.5 |
-
-  We profiled that ~16 ms and found it was **launch overhead, not compute** (codec
-  decode is ~flat regardless of window size; CUDA-graph replay = ~3 ms, 4.5×; see
-  `benchmarks/bench_codec_graph.py`). **CUDA-graphing the codec** (`_GraphedCodecDecoder`,
-  a per-shape graph cache — lossless) removes that fixed per-call overhead, which is
-  the dominant RTF term at small chunks. With it, **`chunk_size=2` measures TTFC ~43 ms
-  AND RTF ~0.091 (warm) — both strict targets at one operating point**, where the eager
-  codec could hit only one at a time. The remaining TTFC floor is the ~21 ms PyTorch
-  prefill (kernelizing it is the next lever). (The table above is the eager-codec curve,
-  kept for the per-stage breakdown; the codec graph shifts the whole curve down.)
+**Next lever.** With the codec graphed, the remaining TTFC floor is the ~20 ms
+PyTorch prefill (the talker's variable-length text forward, still eager) —
+kernelizing it would push TTFC lower still. The chunk-size / codec tradeoff and all
+the operating points are in *Headline results*.
 
 ## Credits
 

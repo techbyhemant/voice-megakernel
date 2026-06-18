@@ -90,6 +90,7 @@ class TalkerKernel:
         self._mlp = torch.empty(INTERMEDIATE_SIZE, **f32)
         self._norm_out = torch.empty(HIDDEN_SIZE, **f32)
         self._scale = 1.0 / math.sqrt(HEAD_DIM)
+        self._prefill = 0   # KV positions filled by the last prefill (overflow-guard context)
 
     def reset(self):
         self._k_cache.zero_()
@@ -104,10 +105,21 @@ class TalkerKernel:
             seq = k.shape[2]
             self._k_cache[li, :, :seq, :].copy_(k[0].to(torch.bfloat16))
             self._v_cache[li, :, :seq, :].copy_(v[0].to(torch.bfloat16))
+        self._prefill = seq
         return seq
 
     def step(self, input_hidden, position):
         """input_hidden: bf16 [HIDDEN_SIZE] on cuda. Returns final-norm hidden (f32 [HIDDEN_SIZE])."""
+        # GUARD: valid KV positions are 0..MAX_SEQ_LEN-1. The kernel writes
+        # k_cache + position*HEAD_DIM with NO bounds check, so position>=MAX_SEQ_LEN
+        # is an out-of-bounds write -> memory corruption -> hang. Fail cleanly
+        # instead (server's finally{} releases the lock; the turn ends, box survives).
+        # faster_qwen3_tts breaks at max_seq_len-1 upstream, so this is belt-and-braces.
+        if position >= MAX_SEQ_LEN:
+            raise RuntimeError(
+                f"[MK talker] KV-cache OVERFLOW: position={position} >= MAX_SEQ_LEN={MAX_SEQ_LEN} "
+                f"(prefill={self._prefill}, decoded≈{position - self._prefill} frames)."
+            )
         torch.ops.qwen_megakernel_C.decode_from_hidden(
             self._norm_out, input_hidden.reshape(-1).contiguous(),
             self._packed, self._final_norm, self._cos, self._sin,

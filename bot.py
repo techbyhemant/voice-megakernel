@@ -13,6 +13,19 @@ Run it with:
 
 import asyncio
 import os
+import sys
+import warnings
+
+# --- Quiet terminal: keep ONLY our clean conversation view --------------------
+# Pipecat logs everything at DEBUG via loguru (frame links, per-turn context
+# dumps, mute toggles...) and the SDK emits DeprecationWarnings. We silence both
+# so the terminal shows just the colorized transcript + live metrics. Configure
+# this BEFORE importing pipecat so its startup banner is suppressed too. Real
+# problems still surface: loguru WARNING+ stays on.
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+from loguru import logger
+logger.remove()
+logger.add(sys.stderr, level="WARNING")
 
 from dotenv import load_dotenv
 
@@ -38,6 +51,7 @@ from pipecat.transports.local.audio import (
 )
 
 from remote_tts_service import RemoteQwenTTSService
+from debug_taps import DebugTap
 
 # Brain runs on the 5090 (Ollama), reached over the SSH tunnel — keyless and on
 # the reimbursed GPU. Tunnel maps local 11435 -> box 11434 (avoids clashing with
@@ -46,13 +60,9 @@ LLM_MODEL = "qwen2.5:7b-instruct"            # served by Ollama on the 5090
 REMOTE_LLM_BASE = "http://localhost:11435/v1"
 CLAUDE_MODEL = "claude-sonnet-4-6"           # only used if ANTHROPIC_API_KEY is set
 
-# Barge-in control:
-#   True  = mic stays live while the bot speaks, so you can interrupt it (real
-#           phone-call feel). REQUIRES HEADPHONES — on speakers the bot hears its
-#           own voice and interrupts itself. The server handles a mid-reply cancel
-#           cleanly (lock release + watchdog), so this is now safe end-to-end.
-#   False = mute the mic while the bot speaks (speaker-safe, strict turn-taking).
-# Use headphones with True; switch to False if you must demo on speakers.
+# Barge-in: True = mic stays live so you can interrupt the bot (needs headphones,
+# else it hears its own voice); False = mute the mic while it speaks (speaker-safe,
+# strict turn-taking). False is the demo default.
 ALLOW_INTERRUPTIONS = False
 
 # Carrier-negotiation persona (e3's domain). Warm + brief: on a real phone call
@@ -65,25 +75,30 @@ SYSTEM_PROMPT = (
     "or rate until they have named a lane. Do not invent a shipment.\n\n"
     "HOW THE RATE WORKS — get this right:\n"
     "- You PAY the carrier per mile. They push for a HIGHER rate; you want to keep it LOW.\n"
-    "- Your FIRST offer is your anchor: low end, about $1.45–1.55/mi.\n"
-    "- Every later offer must move UP toward their number, in small 5–10 cent steps. "
-    "NEVER say a number lower than one you already offered. NEVER jump straight to their ask.\n"
-    "- Your CEILING is $2.00/mi — never exceed it.\n"
-    "- RULE OF THUMB: if they ask for MORE than your last offer, reply with a number "
-    "BETWEEN your last offer and their ask (e.g. you said 1.65, they want 1.85 → you say 1.72), "
-    "or accept if their ask is at/under your ceiling and you're close.\n"
-    "- Justify briefly (lane, miles, market); stay warm and confident.\n\n"
-    "MARKET: Dry-van spot rates ~$1.40–$2.10/mi depending on lane.\n\n"
-    "OUTPUT — this is a live phone call:\n"
-    "- Reply with ONE natural sentence. Say ONE thing — a greeting, a question, an "
-    "offer, or a counter — then STOP. Never two sentences, never a follow-up "
-    "question tacked on the end. Keep it conversational, not curt.\n\n"
-    "EXAMPLES (one reply each — notice the rate only ever moves UP):\n"
-    "  Them: 'Hey, how's it going?'  You: 'Doing great — where are you headed?'\n"
-    "  Them: 'Dallas to Houston.'  You: 'I can start at one fifty a mile, that work?'\n"
-    "  Them: 'I need one eighty.'  You: 'I can come up to one sixty-two, fair?'\n"
-    "  Them: 'Closer to one eighty.'  You: 'Best I can do is one seventy, you in?'\n"
-    "  Them: 'Deal.'  You: 'Done — I'll send the rate con over now.'"
+    "- Your FIRST offer is your anchor: low end, around a dollar fifty a mile.\n"
+    "- Every later offer must move UP toward their number, in small five-to-ten-cent steps. "
+    "NEVER offer a number lower than one you already said. NEVER jump straight to their ask.\n"
+    "- Your CEILING is two dollars a mile — never exceed it.\n"
+    "- If they ask for MORE than your last offer, counter with a number BETWEEN your last "
+    "offer and their ask (you said a dollar sixty-five, they want a dollar eighty-five, so you "
+    "say a dollar seventy-two), or accept if their ask is at or under your ceiling and you're close.\n"
+    "- Justify briefly (lane, miles, market) and stay warm and confident.\n\n"
+    "MARKET: dry-van spot rates run about a dollar forty to two dollars ten a mile depending on lane.\n\n"
+    "SAYING THE RATE — you're on a phone and every word is read ALOUD by a voice:\n"
+    "- Always say a rate as spoken dollars and cents: 'a dollar fifty-five a mile' or "
+    "'a buck sixty a mile'. NEVER say a bare 'one fifty-five', and NEVER use digits or a "
+    "dollar sign (1.55 or $1.55) — they get mispronounced out loud.\n\n"
+    "OUTPUT — this is a live phone call, so be warm but TIGHT:\n"
+    "- Reply with exactly ONE sentence, then STOP. This includes hellos, confirmations, and "
+    "goodbyes — even closing the deal is ONE sentence. If a second sentence is forming, cut it. "
+    "Never tack a follow-up question on the end.\n"
+    "- Sound personable and human, not robotic or curt — one warm, natural sentence.\n\n"
+    "EXAMPLES (ONE sentence each — note rates are spoken in dollars and only move UP):\n"
+    "  Them: 'Hey, how's it going?'  You: 'Doing great, where are you headed today?'\n"
+    "  Them: 'Dallas to Houston.'  You: 'Nice lane, I can start you at a dollar fifty a mile, that work?'\n"
+    "  Them: 'I need one eighty.'  You: 'I hear you, I can come up to a dollar sixty-two on that run.'\n"
+    "  Them: 'Closer to one eighty.'  You: 'Best I can do is a dollar seventy, you in?'\n"
+    "  Them: 'Deal.'  You: 'Awesome, I'll send the rate confirmation right over.'"
 )
 
 
@@ -98,14 +113,14 @@ def _build_brain():
     print(f"Brain: Ollama ({LLM_MODEL}) on the 5090 via {REMOTE_LLM_BASE}")
     # max_tokens is a RUNAWAY BACKSTOP, not the length target — one natural sentence
     # is ~15-30 tokens, so 64 never clips a real reply but kills a multi-sentence
-    # monologue. Brevity comes from the prompt ("one sentence"); low temperature
-    # keeps it on-rule and consistent instead of improvising extra clauses.
+    # monologue. Brevity comes from the prompt ("one sentence"); a modest
+    # temperature keeps it on-rule while still sounding natural.
     return OLLamaLLMService(
         base_url=REMOTE_LLM_BASE,
         settings=OLLamaLLMService.Settings(
             model=LLM_MODEL,
             max_tokens=64,
-            temperature=0.3,
+            temperature=0.6,
         ),
     )
 
@@ -191,11 +206,16 @@ async def main():
     )
 
     # --- The conveyor belt: order matters, data flows top -> bottom -------
+    # The two DebugTaps are pass-through probes that print the live transcript:
+    # the STT tap shows what you said, the LLM tap shows Marcus's reply + timing.
+    # They forward every frame unchanged (no behavior change).
     pipeline = Pipeline([
         transport.input(),   # mic audio in
         stt,                 # audio -> text
+        DebugTap("STT"),     # 👂 print the user's transcription
         user_agg,            # add your words to the conversation
         llm,                 # conversation -> reply text
+        DebugTap("LLM"),     # 🧠 print Marcus's reply + LLM timing
         tts,                 # reply text -> audio frames (streamed)
         transport.output(),  # audio -> speaker
         assistant_agg,       # remember the bot's reply

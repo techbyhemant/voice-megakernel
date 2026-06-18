@@ -1,8 +1,8 @@
 """
 bench_codec_graph.py — is the codec's fixed ~16ms/call launch overhead or real compute?
 
-bench_codec.py showed codec decode is ~16ms regardless of window size (fixed per-CALL
-cost dominates). If that 16ms is PyTorch eager launch overhead (many small unfused
+Codec decode is ~16ms regardless of window size (fixed per-CALL cost dominates).
+If that 16ms is PyTorch eager launch overhead (many small unfused
 kernels), a CUDA graph / torch.compile replay should slash it — which would lower RTF
 at every chunk_size and potentially hit both strict targets. If it's real GPU compute,
 the graph won't help and we're capped.

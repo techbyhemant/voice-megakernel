@@ -1,0 +1,161 @@
+# faster_qwen3_tts talker-runaway + drag fix (multiple-EOS + filler repeat-stop)
+#
+# The talker intermittently (a) fails to terminate and runs to the cap (minutes of
+# audio for a one-line reply), and (b) DRAGS replies 2-3x. Inherent Qwen3-TTS bug
+# (QwenLM/Qwen3-TTS #118: ~0.5% on stock PyTorch, closed "as not planned"); the
+# CUDA megakernel predictor's feedback drift amplifies it.
+#
+# Root cause: both failures are FILLER OVER-RUNS. Measured on the exact (cudagraph)
+# predictor, real speech CONTENT never repeats the primary codec token past ~34
+# frames; only filler/silence tokens stretch (706, 668 to ~50), and the collapse
+# attractor (1318) runs 700-1800. The megakernel over-sustains those filler tokens.
+#
+# Changes to fast_generate_streaming (used by generate_custom_voice_streaming);
+# multiple-EOS also mirrored into parity_generate_streaming:
+#  1. Multiple-EOS detection: eos_ids = {codec_eos_token_id(2150),
+#     codec_think_eos_id(2157)} (vocab_size=3072 -> text-space EOS ids unreachable,
+#     omitted); un-suppress them and stop on ANY (== -> in).
+#  2. Filler repeat-stop: if the primary codec token repeats MK_REPEAT_STOP
+#     (default 40) in a row, break. 40 is in the content(<=34)/filler(50-1800) gap,
+#     so it trims filler over-runs (kills BOTH the collapse and the drag) without
+#     touching real speech. MK_REPEAT_STOP=0 disables.
+#
+# Pairs with the server-side dynamic cap (tts_server._dynamic_cap) as final
+# catch-all. Apply: cd /venv/main/lib/python3.12/site-packages && patch -p1 < this
+#
+--- a/faster_qwen3_tts/streaming.py
++++ b/faster_qwen3_tts/streaming.py
+@@ -5,6 +5,7 @@
+ Yields codec ID chunks during generation instead of collecting all at once.
+ CUDA graph usage is identical to non-streaming — same per-step performance.
+ """
++import os
+ import time
+ from typing import Generator, Tuple
+ 
+@@ -45,10 +46,23 @@
+     vocab_size = config.vocab_size
+     device = talker_input_embeds.device
+ 
++    # Multiple-EOS detection (fix for runaway generation / missing EOS — Qwen3-TTS
++    # issue #118). The talker can legitimately terminate with the "think" EOS
++    # (codec_think_eos_id) as well as the primary codec EOS. The original code
++    # suppressed every high codec token EXCEPT the single primary EOS — which also
++    # BLOCKED the alternate stop token, so when the model tried to end via it, it
++    # couldn't, and ran away to max_new_tokens. Fix: allow every reachable terminal
++    # token to be emitted, and treat ANY of them as a stop.
++    eos_ids = {eos_id}
++    for _name in ("codec_think_eos_id",):
++        _v = getattr(config, _name, None)
++        if isinstance(_v, int) and 0 <= _v < vocab_size:
++            eos_ids.add(_v)
++
+     suppress_mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+     suppress_start = max(0, vocab_size - 1024)
+     for i in range(suppress_start, vocab_size):
+-        if i != eos_id:
++        if i not in eos_ids:
+             suppress_mask[i] = True
+ 
+     predictor = talker.code_predictor
+@@ -86,7 +100,7 @@
+         top_p=top_p,
+         do_sample=do_sample,
+         suppress_mask=suppress_mask,
+-        suppress_tokens=[eos_id] if suppress_eos else None,
++        suppress_tokens=list(eos_ids) if suppress_eos else None,
+     )
+ 
+     prefill_len = talker_graph.prefill_kv(talker_past_kv)
+@@ -103,9 +117,29 @@
+     chunk_count = 0
+     chunk_start = time.time()
+ 
++    # Repetition-collapse guard (megakernel-predictor runaway fix). The talker can
++    # fall into a degenerate loop, emitting ONE codec token thousands of times
++    # after the real reply ends (observed: token 1318 repeated 1800+ frames). If
++    # the primary codec token repeats K times in a row, break — stops the collapse
++    # and recovers the reply. K is MEASURED on the exact (cudagraph) predictor:
++    # real speech CONTENT never repeats the primary token past ~34; only filler/
++    # silence tokens (706, 668) stretch to ~50, and the collapse attractor (1318)
++    # runs 700-1800. K=40 sits in the content/filler gap, so it trims filler runs
++    # that gap — no false clips of real speech, cuts a collapse at ~8s (the dynamic
++    # cap co-bounds short replies tighter). MK_REPEAT_STOP=0 disables.
++    _rep_stop = int(os.environ.get("MK_REPEAT_STOP", "40"))
++    _last_tok, _rep = -1, 0
++
+     for step_idx in range(max_new_tokens):
+-        if token.item() == eos_id:
++        tok_id = token.item()
++        if tok_id in eos_ids:
+             break
++        if tok_id == _last_tok:
++            _rep += 1
++        else:
++            _rep, _last_tok = 0, tok_id
++        if _rep_stop and _rep >= _rep_stop:
++            break
+ 
+         # --- CUDA-Graphed Code Predictor ---
+         last_id_hidden = talker_codec_embed(token.unsqueeze(1))
+@@ -148,7 +182,7 @@
+             top_p=top_p,
+             do_sample=do_sample,
+             suppress_mask=suppress_mask,
+-            suppress_tokens=[eos_id] if suppress_eos else None,
++            suppress_tokens=list(eos_ids) if suppress_eos else None,
+         )
+         past_hidden = hidden_states[:, -1:, :].clone()
+         gen_step += 1
+@@ -218,10 +252,23 @@
+     vocab_size = config.vocab_size
+     device = talker_input_embeds.device
+ 
++    # Multiple-EOS detection (fix for runaway generation / missing EOS — Qwen3-TTS
++    # issue #118). The talker can legitimately terminate with the "think" EOS
++    # (codec_think_eos_id) as well as the primary codec EOS. The original code
++    # suppressed every high codec token EXCEPT the single primary EOS — which also
++    # BLOCKED the alternate stop token, so when the model tried to end via it, it
++    # couldn't, and ran away to max_new_tokens. Fix: allow every reachable terminal
++    # token to be emitted, and treat ANY of them as a stop.
++    eos_ids = {eos_id}
++    for _name in ("codec_think_eos_id",):
++        _v = getattr(config, _name, None)
++        if isinstance(_v, int) and 0 <= _v < vocab_size:
++            eos_ids.add(_v)
++
+     suppress_mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+     suppress_start = max(0, vocab_size - 1024)
+     for i in range(suppress_start, vocab_size):
+-        if i != eos_id:
++        if i not in eos_ids:
+             suppress_mask[i] = True
+ 
+     # === PREFILL ===
+@@ -253,7 +300,7 @@
+         top_p=top_p,
+         do_sample=do_sample,
+         suppress_mask=suppress_mask,
+-        suppress_tokens=[eos_id] if suppress_eos else None,
++        suppress_tokens=list(eos_ids) if suppress_eos else None,
+     )
+ 
+     if attention_mask is not None:
+@@ -270,7 +317,7 @@
+     chunk_start = time.time()
+ 
+     for _ in range(max_new_tokens):
+-        if token.item() == eos_id:
++        if token.item() in eos_ids:
+             break
+ 
+         cache_position = None
+@@ -319,7 +366,7 @@
+             top_p=top_p,
+             do_sample=do_sample,
+             suppress_mask=suppress_mask,
+-            suppress_tokens=[eos_id] if suppress_eos else None,
++            suppress_tokens=list(eos_ids) if suppress_eos else None,
+         )
+ 
+         talker_past_kv = out.past_key_values
